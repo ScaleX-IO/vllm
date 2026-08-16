@@ -521,6 +521,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
         # Per-request high-water mark of tokens actually persisted; the next
         # batch resumes here, so pressure-skipped or failed ranges are retried.
         self._saved_offset: dict[str, int] = {}
+        # Retained only after a failed store so retry events can recover the
+        # token suffix without full snapshots on the normal path.
+        self._retry_token_ids: dict[str, tuple[int, list[int]]] = {}
 
     def add_stored_request(self, req_id: str):
         with self.done_task_lock:
@@ -537,6 +540,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 del self.stored_requests[req_id]
             self._skip_store_requests.discard(req_id)
             self._saved_offset.pop(req_id, None)
+            self._retry_token_ids.pop(req_id, None)
 
     def _record_saved(self, req_id: str, token_len: int) -> None:
         # Guard on liveness so a concurrent finish/preempt pop isn't recreated.
@@ -750,6 +754,17 @@ class KVCacheStoreSendingThread(KVTransferThread):
             self.request_queue.task_done()
             return
 
+        save_completed = False
+        event_token_ids = req_meta.token_ids
+        token_ids_start = req_meta.token_ids_start
+        if self.enable_kv_event:
+            retry_token_ids = self._retry_token_ids.get(req_id)
+            if retry_token_ids is not None and event_token_ids is not None:
+                retry_start, retry_ids = retry_token_ids
+                if retry_start + len(retry_ids) == token_ids_start:
+                    event_token_ids = retry_ids + event_token_ids
+                    token_ids_start = retry_start
+
         # Decrement the in-flight counter and signal task_done() in `finally`
         # so the scheduler can release the GPU blocks it pinned for this
         # request (via `delay_free_blocks`) even when the store path raises.
@@ -809,6 +824,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
             if not keys:
                 self._record_saved(req_id, token_len)
+                save_completed = True
                 return
 
             # Check which blocks already exist (dedup)
@@ -835,6 +851,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
             if not missing_indices:
                 self._record_saved(req_id, token_len)
+                save_completed = True
                 return
 
             if len(missing_indices) != len(keys):
@@ -890,6 +907,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 new_block_hashes = [
                     maybe_convert_block_hash(bh) for bh in kv_event_block_hashes
                 ]
+                token_ids_end = token_ids_start + len(event_token_ids or ())
 
             for idx, (s, e, g_idx) in enumerate(
                 zip(starts, ends, group_indices, strict=True)
@@ -897,9 +915,11 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 db = self.token_databases[g_idx]
                 if self.enable_kv_event:
                     token_ids = (
-                        req_meta.token_ids[s:e]
-                        if req_meta.token_ids is not None
-                        else None
+                        event_token_ids[s - token_ids_start : e - token_ids_start]
+                        if event_token_ids is not None
+                        and token_ids_start <= s
+                        and e <= token_ids_end
+                        else []
                     )
                     stored_event = BlockStored(
                         block_hashes=[new_block_hashes[idx]],
@@ -941,6 +961,13 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 )
                 if failed:
                     failed_codes = set(res[i] for i in failed)
+                    if self.enable_kv_event:
+                        failed_indices = set(failed)
+                        stored_events = [
+                            event
+                            for i, event in enumerate(stored_events)
+                            if i not in failed_indices
+                        ]
                     logger.warning(
                         "batch_put failed: %d/%d keys failed "
                         "(codes=%s, batch_bytes=%d, num_keys=%d), "
@@ -965,6 +992,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                         )
                 else:
                     self._record_saved(req_id, token_len)
+                    save_completed = True
                     if self._clear_store_pressure():
                         logger.info(
                             "Mooncake CPU/disk offloading pressure cleared "
@@ -980,10 +1008,19 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     num_failed_keys=len(keys),
                 )
                 logger.error("Failed to put key %s, error: %s", keys, e)
+                stored_events.clear()
 
             if self.enable_kv_event and stored_events:
                 self.update_kv_event(stored_events)
         finally:
+            if self.enable_kv_event and token_len:
+                if save_completed:
+                    self._retry_token_ids.pop(req_id, None)
+                elif event_token_ids is not None:
+                    self._retry_token_ids[req_id] = (
+                        token_ids_start,
+                        event_token_ids,
+                    )
             self.dec_stored_request(req_id)
             self.request_queue.task_done()
 
