@@ -3,8 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from gpu_kv_connector.hashing import make_namespace
-
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
@@ -22,7 +20,6 @@ class GPUKVConfig:
     prefetch_layers: int
     reset_catalog: bool
     tp_size: int
-    namespace: bytes
 
     @property
     def full_rank_mask(self) -> int:
@@ -68,25 +65,6 @@ class GPUKVConfig:
         tp_size = int(vllm_config.parallel_config.tensor_parallel_size)
         if not 1 <= tp_size < 63:
             raise ValueError("GPUKVConnector supports tensor parallel sizes 1..62")
-        block_size = int(vllm_config.cache_config.block_size)
-        model_config = vllm_config.model_config
-        cache_config = vllm_config.cache_config
-        hf_config = getattr(model_config, "hf_config", None)
-        namespace_fields = {
-            "model": getattr(model_config, "model", None),
-            "revision": getattr(model_config, "revision", None),
-            "tokenizer": getattr(model_config, "tokenizer", None),
-            "tokenizer_revision": getattr(model_config, "tokenizer_revision", None),
-            "dtype": str(getattr(model_config, "dtype", None)),
-            "quantization": getattr(model_config, "quantization", None),
-            "rope_scaling": getattr(hf_config, "rope_scaling", None),
-            "rope_theta": getattr(hf_config, "rope_theta", None),
-            "kv_cache_dtype": str(getattr(cache_config, "cache_dtype", None)),
-            "block_size": block_size,
-            "tensor_parallel_size": tp_size,
-            "layout": "cross-layer-NHD",
-            "namespace": extra.get("namespace", "default"),
-        }
         return cls(
             device_path=str(extra.get("device_path", "/dev/libnvm0")),
             catalog_path=str(
@@ -101,5 +79,4 @@ class GPUKVConfig:
             prefetch_layers=integer("prefetch_layers", 2, 1),
             reset_catalog=boolean("reset_catalog", True),
             tp_size=tp_size,
-            namespace=make_namespace(namespace_fields),
         )

@@ -8,8 +8,6 @@ from gpu_kv_connector.catalog import SQLiteObjectCatalog
 from gpu_kv_connector.config import GPUKVConfig
 from gpu_kv_connector.hashing import (
     OBJECT_ID_BYTES,
-    make_namespace,
-    make_object_id,
     split_object_id,
 )
 from gpu_kv_connector.lifecycle import StoreCompletionTracker
@@ -29,19 +27,12 @@ def _vllm_config(extra: dict[str, object]) -> SimpleNamespace:
     )
 
 
-def test_object_identity_is_namespaced_and_round_trips() -> None:
-    first_namespace = make_namespace({"model": "first"})
-    second_namespace = make_namespace({"model": "second"})
+def test_native_vllm_hash_round_trips() -> None:
     block_hash = bytes(range(32))
-    first = make_object_id(first_namespace, block_hash)
-    second = make_object_id(second_namespace, block_hash)
+    identity = split_object_id(block_hash)
 
-    assert len(first) == OBJECT_ID_BYTES
-    assert first != second
-    key, tag_lo, tag_hi = split_object_id(first)
-    assert first == b"".join(
-        value.to_bytes(8, "little") for value in (key, tag_lo, tag_hi)
-    )
+    assert len(block_hash) == OBJECT_ID_BYTES
+    assert block_hash == b"".join(value.to_bytes(8, "little") for value in identity)
 
 
 def test_catalog_requires_every_tensor_parallel_rank(tmp_path) -> None:

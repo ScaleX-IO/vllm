@@ -8,7 +8,7 @@ import torch
 
 from gpu_kv_connector.catalog import SQLiteObjectCatalog
 from gpu_kv_connector.config import GPUKVConfig
-from gpu_kv_connector.hashing import make_object_ids, split_object_id
+from gpu_kv_connector.hashing import split_object_id
 from gpu_kv_connector.lifecycle import StoreCompletionTracker
 from gpu_kv_connector.metadata import GPUKVConnectorMetadata, GPUKVTransfer
 from vllm.distributed.kv_transfer.kv_connector.utils import yield_req_data
@@ -48,9 +48,6 @@ class GPUKVConnectorScheduler:
         self._pending_store_ids: set[bytes] = set()
         self._store_ids_by_request: dict[str, set[bytes]] = defaultdict(set)
 
-    def _ids(self, block_hashes: list[bytes]) -> list[bytes]:
-        return make_object_ids(self.config.namespace, block_hashes)
-
     def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int
     ) -> tuple[int | None, bool]:
@@ -61,7 +58,7 @@ class GPUKVConnectorScheduler:
         if full_block_tokens - num_computed_tokens < self.block_size:
             return 0, False
         start = num_computed_tokens // self.block_size
-        object_ids = self._ids(list(request.block_hashes[start:num_full_blocks]))
+        object_ids = list(request.block_hashes[start:num_full_blocks])
         hits = self.catalog.longest_ready_prefix(object_ids, self.config.full_rank_mask)
         if hits == 0:
             return 0, False
@@ -96,7 +93,7 @@ class GPUKVConnectorScheduler:
 
         start = num_local_blocks
         end = start + num_external_blocks
-        object_ids = self._ids(list(request.block_hashes[start:end]))
+        object_ids = list(request.block_hashes[start:end])
         self._loads[request_id] = GPUKVTransfer(
             tuple(object_ids), tuple(block_ids[num_local_blocks:])
         )
@@ -124,7 +121,7 @@ class GPUKVConnectorScheduler:
             if end <= start:
                 continue
             block_hashes = list(request.block_hashes[start:end])
-            object_ids = self._ids(block_hashes)
+            object_ids = block_hashes
             ready = self.catalog.ready_set(object_ids, self.config.full_rank_mask)
             candidates: list[tuple[bytes, int]] = []
             block_ids = self._request_block_ids[request_id]
@@ -298,14 +295,17 @@ class GPUKVConnectorWorker:
         self, object_ids: tuple[bytes, ...]
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert self._kv_cache is not None
-        triples = [split_object_id(object_id) for object_id in object_ids]
+        identities = [split_object_id(object_id) for object_id in object_ids]
         keys = torch.tensor(
-            [_as_signed_64(key) for key, _, _ in triples],
+            [_as_signed_64(identity[0]) for identity in identities],
             dtype=torch.int64,
             device=self._kv_cache.device,
         )
         tags = torch.tensor(
-            [[_as_signed_64(lo), _as_signed_64(hi)] for _, lo, hi in triples],
+            [
+                [_as_signed_64(value) for value in identity[1:]]
+                for identity in identities
+            ],
             dtype=torch.int64,
             device=self._kv_cache.device,
         )

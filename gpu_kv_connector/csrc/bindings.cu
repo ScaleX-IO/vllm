@@ -179,8 +179,8 @@ private:
         TORCH_CHECK(tags.scalar_type() == torch::kInt64,
                     "tags must use torch.int64");
         TORCH_CHECK(keys.dim() == 1, "keys must have shape [count]");
-        TORCH_CHECK(tags.dim() == 2 && tags.size(1) == 2,
-                    "tags must have shape [count, 2]");
+        TORCH_CHECK(tags.dim() == 2 && tags.size(1) == 3,
+                    "tags must have shape [count, 3]");
         TORCH_CHECK(keys.size(0) == tags.size(0),
                     "keys and tags must have equal counts");
         TORCH_CHECK(keys.size(0) <= static_cast<int64_t>(UINT32_MAX),

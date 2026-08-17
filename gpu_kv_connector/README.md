@@ -1,9 +1,10 @@
 # GPU-KV connector for vLLM
 
 This external vLLM 0.17 connector stores reusable prefix KV blocks in the
-GPU-KV object layer. vLLM computes chained block hashes on the CPU scheduler;
-GPU-KV maps a namespaced 192-bit object identity to a physical SSD descriptor
-with its GPU-resident LSM index. BaM transfers K/V planes directly between an
+GPU-KV object layer. vLLM computes chained SHA-256 block hashes on the CPU
+scheduler; GPU-KV uses each native 256-bit hash unchanged as the object identity
+and maps it to a physical SSD descriptor with its GPU-resident LSM index. BaM
+transfers K/V planes directly between an
 aligned cross-layer HBM allocation and NVMe. Host DRAM is not a data tier.
 
 One immutable object contains every layer's K and V plane for one vLLM token
@@ -60,8 +61,10 @@ vllm serve meta-llama/Meta-Llama-3-8B-Instruct \
   }'
 ```
 
-Use a distinct `catalog_path` and a disjoint `disk_start_page`/`capacity_pages`
-range for concurrent servers. `capacity_pages` is the capacity of each
+The catalog and SSD extent scope the cache to one compatible model and KV
+layout. Use a distinct `catalog_path` and a disjoint
+`disk_start_page`/`capacity_pages` range for concurrent or incompatible
+servers. `capacity_pages` is the capacity of each
 tensor-parallel rank; rank `r` uses the consecutive range beginning at
 `disk_start_page + r * capacity_pages`.
 
