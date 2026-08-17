@@ -6,6 +6,7 @@ import pytest
 
 from gpu_kv_connector.catalog import SQLiteObjectCatalog
 from gpu_kv_connector.config import GPUKVConfig
+from gpu_kv_connector.connector import GPUKVConnectorScheduler
 from gpu_kv_connector.hashing import (
     OBJECT_ID_BYTES,
     split_object_id,
@@ -51,6 +52,22 @@ def test_catalog_requires_every_tensor_parallel_rank(tmp_path) -> None:
     assert first.longest_ready_prefix(ids, full_mask=0b11) == 0
     first.close()
     second.close()
+
+
+def test_catalog_hits_load_during_model_forward(tmp_path) -> None:
+    config = GPUKVConfig.from_vllm(
+        _vllm_config({"catalog_path": str(tmp_path / "catalog.sqlite3")})
+    )
+    scheduler = GPUKVConnectorScheduler(_vllm_config({}), config)
+    block_hashes = [bytes([index]) * OBJECT_ID_BYTES for index in range(1, 3)]
+    scheduler.catalog.mark_rank_ready(block_hashes, rank=0)
+    scheduler.catalog.mark_rank_ready(block_hashes, rank=1)
+    request = SimpleNamespace(
+        request_id="request", block_hashes=block_hashes, num_tokens=32
+    )
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (32, False)
+    scheduler.close()
 
 
 def test_config_parses_false_and_missing_optional_model_fields(tmp_path) -> None:

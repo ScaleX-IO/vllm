@@ -44,6 +44,7 @@ class GPUKVConnectorScheduler:
         self._requests: dict[str, Request] = {}
         self._request_block_ids: dict[str, list[int]] = {}
         self._next_store_index: dict[str, int] = {}
+        self._load_starts: dict[str, int] = {}
         self._loads: dict[str, GPUKVTransfer] = {}
         self._pending_store_ids: set[bytes] = set()
         self._store_ids_by_request: dict[str, set[bytes]] = defaultdict(set)
@@ -65,7 +66,8 @@ class GPUKVConnectorScheduler:
         hit_tokens = (start + hits) * self.block_size - num_computed_tokens
         if hit_tokens < self.block_size:
             return 0, False
-        return hit_tokens, True
+        self._load_starts[request.request_id] = start
+        return hit_tokens, False
 
     def update_state_after_alloc(
         self,
@@ -80,22 +82,14 @@ class GPUKVConnectorScheduler:
             return
 
         block_ids = blocks.get_block_ids()[0]
-        num_local_blocks = sum(
-            block.block_hash is not None for block in blocks.blocks[0]
-        )
-        num_local_tokens = num_local_blocks * self.block_size
-        total_full_tokens = num_local_tokens + num_external_tokens
-        if total_full_tokens % self.block_size != 0:
+        if num_external_tokens % self.block_size != 0:
             raise RuntimeError("external KV token count is not block aligned")
         num_external_blocks = num_external_tokens // self.block_size
-        if num_external_blocks != len(block_ids) - num_local_blocks:
-            raise RuntimeError("external KV allocation does not match GPU blocks")
-
-        start = num_local_blocks
+        start = self._load_starts.pop(request_id)
         end = start + num_external_blocks
         object_ids = list(request.block_hashes[start:end])
         self._loads[request_id] = GPUKVTransfer(
-            tuple(object_ids), tuple(block_ids[num_local_blocks:])
+            tuple(object_ids), tuple(block_ids[start:end])
         )
         self._next_store_index[request_id] = end
 
@@ -167,6 +161,7 @@ class GPUKVConnectorScheduler:
         self._requests.pop(request_id, None)
         self._request_block_ids.pop(request_id, None)
         self._next_store_index.pop(request_id, None)
+        self._load_starts.pop(request_id, None)
         return request_id in self._store_ids_by_request, None
 
     def close(self) -> None:
@@ -210,7 +205,6 @@ class GPUKVConnectorWorker:
         self._write_stream: torch.cuda.Stream | None = None
         self._active_loads: list[_IOOperation] = []
         self._active_stores: list[_IOOperation] = []
-        self._pending_loads: list[_IOOperation] = []
         self._unsubmitted_stores: list[_IOOperation] = []
         self._pending_stores: list[_IOOperation] = []
         self._store_tracker = StoreCompletionTracker()
@@ -470,7 +464,6 @@ class GPUKVConnectorWorker:
             self._make_operation(request_id, transfer, reserve=False)
             for request_id, transfer in metadata.loads.items()
         ]
-        self._pending_loads.extend(self._active_loads)
         initial = min(self.config.prefetch_layers, self._num_layers)
         for operation in self._active_loads:
             for layer in range(initial):
@@ -568,18 +561,8 @@ class GPUKVConnectorWorker:
             self._submit_deferred_stores(finish_submit)
         self._reap_stores()
 
-        finished_recving: set[str] = set()
-        pending_loads: list[_IOOperation] = []
-        for operation in self._pending_loads:
-            final = operation.layer_events.get(self._num_layers - 1)
-            if final is not None and final.query():
-                finished_recving.add(operation.request_id)
-            else:
-                pending_loads.append(operation)
-        self._pending_loads = pending_loads
-
         finished_sending = self._store_tracker.take_ready()
-        return finished_sending, finished_recving
+        return finished_sending, set()
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         result = self._invalid_block_ids
