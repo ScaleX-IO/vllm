@@ -161,6 +161,13 @@ class MultiConnector(KVConnectorBase_V1):
             return False
         return all(c.prefer_cross_layer_blocks for c in self._connectors)
 
+    @property
+    def required_kv_cache_alignment(self) -> int:
+        return max(
+            (c.required_kv_cache_alignment for c in self._connectors),
+            default=1,
+        )
+
     @classmethod
     def _get_connector_classes_and_configs(
         cls, vllm_config: "VllmConfig"

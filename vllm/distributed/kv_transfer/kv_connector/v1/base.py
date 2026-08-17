@@ -157,6 +157,11 @@ class KVConnectorBase_V1(ABC):
         """
         return False
 
+    @property
+    def required_kv_cache_alignment(self) -> int:
+        """Byte alignment required for a cross-layer KV allocation."""
+        return 1
+
     def __init__(
         self,
         vllm_config: "VllmConfig",

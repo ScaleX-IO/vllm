@@ -261,11 +261,22 @@ class KVConnectorModelRunnerMixin:
 
         logger.info("Allocating a cross layer KV cache of shape %s", kv_cache_shape)
 
-        # allocate one contiguous buffer for all layers
-        cross_layers_kv_cache = (
-            torch.zeros(total_size, dtype=torch.int8, device=device)
-            .view(kv_cache_spec.dtype)
-            .view(kv_cache_shape)
+        # Allocate one contiguous buffer for all layers. GPU-direct storage
+        # connectors may require a stronger base alignment than PyTorch's
+        # caching allocator normally guarantees, so retain a padded backing
+        # allocation and expose an aligned view of exactly total_size bytes.
+        alignment = 1
+        if has_kv_transfer_group():
+            alignment = get_kv_transfer_group().required_kv_cache_alignment
+        if alignment < 1 or alignment & (alignment - 1):
+            raise ValueError("KV connector allocation alignment must be a power of two")
+        raw_kv_cache = torch.zeros(
+            total_size + alignment - 1, dtype=torch.int8, device=device
+        )
+        aligned_offset = (-raw_kv_cache.data_ptr()) & (alignment - 1)
+        aligned_kv_cache = raw_kv_cache.narrow(0, aligned_offset, total_size)
+        cross_layers_kv_cache = aligned_kv_cache.view(kv_cache_spec.dtype).view(
+            kv_cache_shape
         )
 
         # Maintain original KV shape view.
