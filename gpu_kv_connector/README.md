@@ -13,6 +13,17 @@ can be grouped after logical lookup without changing prefix-cache granularity.
 The SQLite catalog records only whether every tensor-parallel rank completed
 an object; it never stores SSD locations.
 
+The read path resolves native vLLM SHA-256 identities on the GPU, forms bounded
+physical runs only after resolution, and pipelines a fixed two-layer SSD read
+window with model execution. K and V use one layer-level native call. Independent vLLM
+requests remain independent I/O operations: combining unrelated requests was
+measured to reduce four-request throughput because their SSD stripes were not
+physically contiguous.
+
+Writes are deferred until a step without external reads, request completion,
+or preemption. Descriptor reservation is deferred with the write, so its
+device-wide metadata synchronization cannot delay a mixed read/compute step.
+
 ## Build
 
 Build GPU-KV and BaM first, then install the connector and native extension in
@@ -72,3 +83,30 @@ The primary evaluation target is repeated long-prefix serving with
 Llama-3-8B-Instruct on LEval and LooGLE. Compare against vLLM recomputation and
 LMCache SSD/GDS under the same prefix hit trace, request arrival process, TTFT,
 ITL, throughput, and SSD configuration.
+
+## Component benchmark
+
+The included benchmark fills distinct block-aligned prefixes and reloads them
+after the configured HBM cache has evicted them:
+
+```bash
+export GPUKV_MODEL=/path/to/local/model
+sudo -E ./gpu_kv_connector/benchmarks/serve_prefix_benchmark.sh
+
+python gpu_kv_connector/benchmarks/benchmark_prefix_reload.py \
+  --model "$GPUKV_MODEL" --require-external-hits
+
+# Run the fixed one-factor component matrix (requires BaM privileges).
+sudo -E ./gpu_kv_connector/benchmarks/run_component_ablation.sh
+```
+
+Use `GPUKV_MAX_SUPERREQUEST_OBJECTS=0`, `GPUKV_FUSE_KV_PLANES=false`,
+`GPUKV_PREFETCH_LAYERS=1`, or `GPUKV_READY_CACHE_ENTRIES=0` for one-factor
+ablations. `GPUKV_BENCH_MODE=recompute` starts the same vLLM configuration
+without the external connector. Stop one server before starting the next so
+only one process owns the BaM controller.
+
+The small Qwen2.5-0.5B smoke workload is suitable for correctness and component
+overhead checks, but its prompt recomputation is faster than SSD reload. It is
+not evidence that GPU-KV improves end-to-end performance for larger models;
+that claim requires the long-prefix target workloads above.

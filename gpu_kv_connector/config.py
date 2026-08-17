@@ -17,7 +17,16 @@ class GPUKVConfig:
     max_batch: int
     queue_depth: int
     num_queues: int
+    max_request_pages: int
+    max_superrequest_objects: int
+    min_superrequest_objects: int
+    superrequest_target_bytes: int
+    min_superrequest_bytes: int
+    read_executor_blocks: int
+    write_executor_blocks: int
     prefetch_layers: int
+    ready_cache_entries: int
+    fuse_kv_planes: bool
     reset_catalog: bool
     tp_size: int
 
@@ -76,7 +85,18 @@ class GPUKVConfig:
             max_batch=integer("max_batch", 8192, 1),
             queue_depth=integer("queue_depth", 64, 2),
             num_queues=integer("num_queues", 16, 1),
+            max_request_pages=integer("max_request_pages", 0),
+            max_superrequest_objects=integer("max_superrequest_objects", 512),
+            min_superrequest_objects=integer("min_superrequest_objects", 2, 1),
+            superrequest_target_bytes=integer(
+                "superrequest_target_bytes", 512 * 1024, 4096
+            ),
+            min_superrequest_bytes=integer("min_superrequest_bytes", 64 * 1024),
+            read_executor_blocks=integer("read_executor_blocks", 16, 1),
+            write_executor_blocks=integer("write_executor_blocks", 8, 1),
             prefetch_layers=integer("prefetch_layers", 2, 1),
+            ready_cache_entries=integer("ready_cache_entries", 65_536),
+            fuse_kv_planes=boolean("fuse_kv_planes", True),
             reset_catalog=boolean("reset_catalog", True),
             tp_size=tp_size,
         )

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -8,7 +8,6 @@ import torch
 
 from gpu_kv_connector.catalog import SQLiteObjectCatalog
 from gpu_kv_connector.config import GPUKVConfig
-from gpu_kv_connector.hashing import split_object_id
 from gpu_kv_connector.lifecycle import StoreCompletionTracker
 from gpu_kv_connector.metadata import GPUKVConnectorMetadata, GPUKVTransfer
 from vllm.distributed.kv_transfer.kv_connector.utils import yield_req_data
@@ -30,8 +29,21 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _as_signed_64(value: int) -> int:
-    return value if value < (1 << 63) else value - (1 << 64)
+def _physical_superrequest_limits(
+    config: GPUKVConfig, plane_bytes: int
+) -> tuple[int, int]:
+    if config.max_superrequest_objects == 0:
+        return 0, config.min_superrequest_objects
+    byte_limited_max = config.superrequest_target_bytes // plane_bytes
+    maximum = min(config.max_superrequest_objects, byte_limited_max)
+    minimum = max(
+        config.min_superrequest_objects,
+        (config.min_superrequest_bytes + plane_bytes - 1) // plane_bytes,
+        2,
+    )
+    if maximum < minimum:
+        return 0, config.min_superrequest_objects
+    return maximum, minimum
 
 
 class GPUKVConnectorScheduler:
@@ -48,6 +60,18 @@ class GPUKVConnectorScheduler:
         self._loads: dict[str, GPUKVTransfer] = {}
         self._pending_store_ids: set[bytes] = set()
         self._store_ids_by_request: dict[str, set[bytes]] = defaultdict(set)
+        self._loaded_objects_by_request: dict[str, dict[int, bytes]] = {}
+        self._ready_cache: OrderedDict[bytes, None] = OrderedDict()
+
+    def _cache_ready(self, object_ids: list[bytes] | set[bytes]) -> None:
+        limit = self.config.ready_cache_entries
+        if limit == 0:
+            return
+        for object_id in object_ids:
+            self._ready_cache[object_id] = None
+            self._ready_cache.move_to_end(object_id)
+        while len(self._ready_cache) > limit:
+            self._ready_cache.popitem(last=False)
 
     def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int
@@ -60,11 +84,30 @@ class GPUKVConnectorScheduler:
             return 0, False
         start = num_computed_tokens // self.block_size
         object_ids = list(request.block_hashes[start:num_full_blocks])
-        hits = self.catalog.longest_ready_prefix(object_ids, self.config.full_rank_mask)
+        cached_hits = 0
+        while (
+            cached_hits < len(object_ids)
+            and object_ids[cached_hits] in self._ready_cache
+        ):
+            cached_hits += 1
+        hits = cached_hits
+        if cached_hits < len(object_ids):
+            hits += self.catalog.longest_ready_prefix(
+                object_ids[cached_hits:], self.config.full_rank_mask
+            )
         if hits == 0:
             return 0, False
+        self._cache_ready(object_ids[:hits])
         hit_tokens = (start + hits) * self.block_size - num_computed_tokens
         if hit_tokens < self.block_size:
+            return 0, False
+
+        # vLLM must execute at least the final input token to produce logits.
+        # The corresponding cache block is still loaded in full; only the
+        # reported computed-token count excludes that final token.
+        if num_computed_tokens + hit_tokens >= request.num_tokens:
+            hit_tokens = request.num_tokens - num_computed_tokens - 1
+        if hit_tokens <= 0:
             return 0, False
         self._load_starts[request.request_id] = start
         return hit_tokens, False
@@ -82,12 +125,17 @@ class GPUKVConnectorScheduler:
             return
 
         block_ids = blocks.get_block_ids()[0]
-        if num_external_tokens % self.block_size != 0:
-            raise RuntimeError("external KV token count is not block aligned")
-        num_external_blocks = num_external_tokens // self.block_size
+        # A full-prefix hit reports one fewer token so vLLM recomputes the
+        # final token, but that token shares a block with cached predecessors.
+        # Load every block touched by the externally computed token range.
+        num_external_blocks = (
+            num_external_tokens + self.block_size - 1
+        ) // self.block_size
         start = self._load_starts.pop(request_id)
         end = start + num_external_blocks
         object_ids = list(request.block_hashes[start:end])
+        loaded = dict(zip(block_ids[start:end], object_ids))
+        self._loaded_objects_by_request[request_id] = loaded
         self._loads[request_id] = GPUKVTransfer(
             tuple(object_ids), tuple(block_ids[start:end])
         )
@@ -116,7 +164,18 @@ class GPUKVConnectorScheduler:
                 continue
             block_hashes = list(request.block_hashes[start:end])
             object_ids = block_hashes
-            ready = self.catalog.ready_set(object_ids, self.config.full_rank_mask)
+            unknown = [
+                object_id
+                for object_id in object_ids
+                if object_id not in self._ready_cache
+                and object_id not in self._pending_store_ids
+            ]
+            ready = (
+                self.catalog.ready_set(unknown, self.config.full_rank_mask)
+                if unknown
+                else set()
+            )
+            self._cache_ready(ready)
             candidates: list[tuple[bytes, int]] = []
             block_ids = self._request_block_ids[request_id]
             if len(block_ids) < end:
@@ -125,7 +184,10 @@ class GPUKVConnectorScheduler:
                     f"needs {end} full blocks"
                 )
             for offset, object_id in enumerate(object_ids):
-                if object_id in ready or object_id in self._pending_store_ids:
+                if (
+                    object_id in self._ready_cache
+                    or object_id in self._pending_store_ids
+                ):
                     continue
                 candidates.append((object_id, block_ids[start + offset]))
 
@@ -152,6 +214,14 @@ class GPUKVConnectorScheduler:
         for request_id in connector_output.finished_sending or ():
             object_ids = self._store_ids_by_request.pop(request_id, set())
             self._pending_store_ids.difference_update(object_ids)
+            self._cache_ready(object_ids)
+        invalid_block_ids = connector_output.invalid_block_ids or set()
+        if invalid_block_ids:
+            for loaded in self._loaded_objects_by_request.values():
+                for block_id in invalid_block_ids:
+                    object_id = loaded.get(block_id)
+                    if object_id is not None:
+                        self._ready_cache.pop(object_id, None)
 
     def request_finished(
         self, request: Request, block_ids: list[int]
@@ -162,6 +232,7 @@ class GPUKVConnectorScheduler:
         self._request_block_ids.pop(request_id, None)
         self._next_store_index.pop(request_id, None)
         self._load_starts.pop(request_id, None)
+        self._loaded_objects_by_request.pop(request_id, None)
         return request_id in self._store_ids_by_request, None
 
     def close(self) -> None:
@@ -175,6 +246,7 @@ class _NativeBatch:
     descriptors: torch.Tensor
     status: torch.Tensor
     base_offsets: torch.Tensor
+    host_status: torch.Tensor | None = None
 
 
 @dataclass
@@ -182,11 +254,13 @@ class _IOOperation:
     request_id: str
     object_ids: tuple[bytes, ...]
     batches: list[_NativeBatch]
+    store_transfer: GPUKVTransfer | None = None
     layer_events: dict[int, torch.cuda.Event] = field(default_factory=dict)
     compute_ready: dict[int, torch.cuda.Event] = field(default_factory=dict)
     metadata_ready: torch.cuda.Event | None = None
     submitted: bool = False
     final_event: torch.cuda.Event | None = None
+    status_checked: bool = False
 
 
 class GPUKVConnectorWorker:
@@ -249,6 +323,9 @@ class GPUKVConnectorWorker:
         device = kv_cache.device.index
         if device is None:
             raise ValueError("KV cache does not have a concrete CUDA device")
+        max_superrequest_objects, min_superrequest_objects = (
+            _physical_superrequest_limits(self.config, plane_bytes)
+        )
         self._native = ObjectStore(
             self.config.device_path,
             self.config.disk_start_for_rank(self.rank),
@@ -259,6 +336,11 @@ class GPUKVConnectorWorker:
             self.config.max_batch,
             self.config.queue_depth,
             self.config.num_queues,
+            self.config.max_request_pages,
+            max_superrequest_objects,
+            min_superrequest_objects,
+            self.config.read_executor_blocks,
+            self.config.write_executor_blocks,
             device,
         )
         self._region_id = int(self._native.register_region(kv_cache))
@@ -270,10 +352,12 @@ class GPUKVConnectorWorker:
         self._write_stream = torch.cuda.Stream(device=device, priority=0)
         logger.info(
             "Registered GPU-KV cross-layer cache: blocks=%d layers=%d "
-            "plane_bytes=%d rank=%d",
+            "plane_bytes=%d superrequest_objects=%d..%d rank=%d",
             num_blocks,
             num_layers,
             plane_bytes,
+            min_superrequest_objects if max_superrequest_objects else 0,
+            max_superrequest_objects,
             self.rank,
         )
 
@@ -289,28 +373,18 @@ class GPUKVConnectorWorker:
         self, object_ids: tuple[bytes, ...]
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert self._kv_cache is not None
-        identities = [split_object_id(object_id) for object_id in object_ids]
-        keys = torch.tensor(
-            [_as_signed_64(identity[0]) for identity in identities],
-            dtype=torch.int64,
-            device=self._kv_cache.device,
-        )
-        tags = torch.tensor(
-            [
-                [_as_signed_64(value) for value in identity[1:]]
-                for identity in identities
-            ],
-            dtype=torch.int64,
-            device=self._kv_cache.device,
-        )
+        identities = torch.frombuffer(
+            bytearray().join(object_ids), dtype=torch.int64
+        ).reshape(-1, 4)
+        keys = identities[:, 0].contiguous().to(self._kv_cache.device)
+        tags = identities[:, 1:].contiguous().to(self._kv_cache.device)
         return keys, tags
 
     def _make_batches(
         self, transfer: GPUKVTransfer, *, reserve: bool
-    ) -> tuple[list[_NativeBatch], list[tuple[bytes, int, int]]]:
+    ) -> list[_NativeBatch]:
         assert self._native is not None and self._kv_cache is not None
         batches: list[_NativeBatch] = []
-        invalid: list[tuple[bytes, int, int]] = []
         for start in range(0, len(transfer.object_ids), self.config.max_batch):
             object_ids = transfer.object_ids[start : start + self.config.max_batch]
             block_ids = transfer.block_ids[start : start + self.config.max_batch]
@@ -320,22 +394,14 @@ class GPUKVConnectorWorker:
                 if reserve
                 else self._native.resolve(keys, tags)
             )
-            host_status = status.cpu().tolist()
-            if reserve and any(value != 1 for value in host_status):
-                raise RuntimeError(
-                    f"GPU-KV reserve returned invalid statuses: {host_status}"
-                )
-            if not reserve:
-                invalid.extend(
-                    (object_id, block_id, int(value))
-                    for object_id, block_id, value in zip(
-                        object_ids, block_ids, host_status
-                    )
-                    if value != 1
-                )
             base_offsets = torch.tensor(
                 block_ids, dtype=torch.int64, device=self._kv_cache.device
             ).mul_(self._object_bytes)
+            host_status = None
+            if not reserve:
+                host_status = torch.empty(
+                    len(object_ids), dtype=torch.uint8, device="cpu", pin_memory=True
+                )
             batches.append(
                 _NativeBatch(
                     tuple(object_ids),
@@ -343,9 +409,10 @@ class GPUKVConnectorWorker:
                     descriptors,
                     status,
                     base_offsets,
+                    host_status,
                 )
             )
-        return batches, invalid
+        return batches
 
     def _make_operation(
         self, request_id: str, transfer: GPUKVTransfer, *, reserve: bool
@@ -353,24 +420,42 @@ class GPUKVConnectorWorker:
         stream = self._write_stream if reserve else self._read_stream
         assert stream is not None
         with torch.cuda.stream(stream):
-            batches, invalid = self._make_batches(transfer, reserve=reserve)
+            batches = self._make_batches(transfer, reserve=reserve)
             metadata_ready = torch.cuda.Event(blocking=False)
             metadata_ready.record(stream)
-        if invalid:
-            invalid_ids = [object_id for object_id, _, _ in invalid]
-            self.catalog.clear_rank(invalid_ids, self.rank)
-            self._invalid_block_ids.update(block_id for _, block_id, _ in invalid)
-            logger.error(
-                "GPU-KV resolve failed for request %s: %s",
-                request_id,
-                [(block_id, status) for _, block_id, status in invalid],
-            )
         return _IOOperation(
             request_id,
             transfer.object_ids,
             batches,
             metadata_ready=metadata_ready,
         )
+
+    @staticmethod
+    def _make_store_operation(
+        request_id: str, transfer: GPUKVTransfer
+    ) -> _IOOperation:
+        return _IOOperation(
+            request_id,
+            transfer.object_ids,
+            [],
+            store_transfer=transfer,
+        )
+
+    def _materialize_store(self, operation: _IOOperation) -> None:
+        if operation.batches:
+            return
+        if operation.store_transfer is None:
+            raise RuntimeError(
+                f"store request {operation.request_id} has no transfer metadata"
+            )
+        assert self._write_stream is not None
+        with torch.cuda.stream(self._write_stream):
+            operation.batches = self._make_batches(
+                operation.store_transfer, reserve=True
+            )
+            operation.metadata_ready = torch.cuda.Event(blocking=False)
+            operation.metadata_ready.record(self._write_stream)
+        operation.store_transfer = None
 
     def _initialize_layer_order(self, forward_context: ForwardContext) -> None:
         if self._layer_to_index:
@@ -397,8 +482,27 @@ class GPUKVConnectorWorker:
         with torch.cuda.stream(stream):
             if operation.metadata_ready is not None:
                 stream.wait_event(operation.metadata_ready)
-            for plane in (layer * 2, layer * 2 + 1):
-                for batch in operation.batches:
+            first_plane = layer * 2
+            for batch in operation.batches:
+                if self.config.fuse_kv_planes:
+                    if write:
+                        self._native.write_layer(
+                            batch.descriptors,
+                            batch.status,
+                            batch.base_offsets,
+                            first_plane,
+                            self._region_id,
+                        )
+                    else:
+                        self._native.read_layer(
+                            batch.descriptors,
+                            batch.status,
+                            batch.base_offsets,
+                            first_plane,
+                            self._region_id,
+                        )
+                    continue
+                for plane in (first_plane, first_plane + 1):
                     offsets = batch.base_offsets + plane * self._plane_bytes
                     if write:
                         self._native.write_plane(
@@ -416,6 +520,10 @@ class GPUKVConnectorWorker:
                             plane,
                             self._region_id,
                         )
+            if not write and layer == self._num_layers - 1:
+                for batch in operation.batches:
+                    assert batch.host_status is not None
+                    batch.host_status.copy_(batch.status, non_blocking=True)
             event = torch.cuda.Event(blocking=False)
             event.record(stream)
         operation.layer_events[layer] = event
@@ -428,6 +536,7 @@ class GPUKVConnectorWorker:
         for operation in operations:
             if operation.submitted:
                 continue
+            self._materialize_store(operation)
             with torch.cuda.stream(self._write_stream):
                 for layer in range(self._num_layers):
                     ready = operation.compute_ready.get(layer)
@@ -438,7 +547,8 @@ class GPUKVConnectorWorker:
                         )
                     self._write_stream.wait_event(ready)
                     self._issue_layer(operation, layer, write=True)
-                operation.final_event = operation.layer_events[self._num_layers - 1]
+                operation.final_event = torch.cuda.Event(blocking=False)
+                operation.final_event.record(self._write_stream)
             operation.submitted = True
             self._pending_stores.append(operation)
 
@@ -454,7 +564,7 @@ class GPUKVConnectorWorker:
             self._submit_deferred_stores(deferred)
 
         self._active_stores = [
-            self._make_operation(request_id, transfer, reserve=True)
+            self._make_store_operation(request_id, transfer)
             for request_id, transfer in metadata.stores.items()
         ]
         for operation in self._active_stores:
@@ -477,6 +587,7 @@ class GPUKVConnectorWorker:
         for operation in self._active_loads:
             event = self._issue_layer(operation, layer, write=False)
             compute_stream.wait_event(event)
+        for operation in self._active_loads:
             end = min(layer + self.config.prefetch_layers + 1, self._num_layers)
             for future in range(layer + 1, end):
                 self._issue_layer(operation, future, write=False)
@@ -499,7 +610,6 @@ class GPUKVConnectorWorker:
             event = torch.cuda.Event(blocking=False)
             event.record(compute_stream)
             operation.compute_ready[layer] = event
-
     def wait_for_save(self) -> None:
         if not self._active_stores:
             return
@@ -565,6 +675,38 @@ class GPUKVConnectorWorker:
         return finished_sending, set()
 
     def get_block_ids_with_load_errors(self) -> set[int]:
+        for operation in self._active_loads:
+            if operation.status_checked:
+                continue
+            final_event = operation.layer_events.get(self._num_layers - 1)
+            if final_event is None:
+                raise RuntimeError(
+                    f"load request {operation.request_id} did not issue its final layer"
+                )
+            final_event.synchronize()
+            invalid: list[tuple[bytes, int, int]] = []
+            for batch in operation.batches:
+                assert batch.host_status is not None
+                invalid.extend(
+                    (object_id, block_id, int(value))
+                    for object_id, block_id, value in zip(
+                        batch.object_ids,
+                        batch.block_ids,
+                        batch.host_status.tolist(),
+                    )
+                    if value != 1
+                )
+            if invalid:
+                self.catalog.clear_rank(
+                    [object_id for object_id, _, _ in invalid], self.rank
+                )
+                self._invalid_block_ids.update(block_id for _, block_id, _ in invalid)
+                logger.error(
+                    "GPU-KV load failed for request %s: %s",
+                    operation.request_id,
+                    [(block_id, status) for _, block_id, status in invalid],
+                )
+            operation.status_checked = True
         result = self._invalid_block_ids
         self._invalid_block_ids = set()
         return result

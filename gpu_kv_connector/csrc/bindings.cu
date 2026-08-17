@@ -35,6 +35,11 @@ public:
         int64_t max_batch,
         int64_t queue_depth,
         int64_t num_queues,
+        int64_t max_request_pages,
+        int64_t max_superrequest_objects,
+        int64_t min_superrequest_objects,
+        int64_t read_executor_blocks,
+        int64_t write_executor_blocks,
         int64_t cuda_device)
         : cuda_device_(checked_u32(cuda_device, "cuda_device", true)) {
         TORCH_CHECK(disk_start_page >= 0, "disk_start_page must be non-negative");
@@ -51,6 +56,16 @@ public:
         config.plane_bytes = checked_u32(plane_bytes, "plane_bytes");
         config.max_objects = checked_u32(max_objects, "max_objects");
         config.max_batch = checked_u32(max_batch, "max_batch");
+        config.max_request_pages = checked_u32(
+            max_request_pages, "max_request_pages", true);
+        config.max_superrequest_objects = checked_u32(
+            max_superrequest_objects, "max_superrequest_objects", true);
+        config.min_superrequest_objects = checked_u32(
+            min_superrequest_objects, "min_superrequest_objects");
+        config.superrequest_executor_blocks = checked_u32(
+            read_executor_blocks, "read_executor_blocks");
+        config.superrequest_write_executor_blocks = checked_u32(
+            write_executor_blocks, "write_executor_blocks");
         config.capacity_pages = static_cast<uint64_t>(capacity_pages);
         store_ = std::make_unique<GpuStripedObjectStore>(*io_, config);
     }
@@ -128,6 +143,46 @@ public:
             reinterpret_cast<const uint64_t*>(offsets.data_ptr<int64_t>()),
             static_cast<uint32_t>(status.size(0)),
             checked_u16(plane, "plane"), checked_u32(region_id, "region_id", true),
+            at::cuda::getCurrentCUDAStream(cuda_device_).stream());
+    }
+
+    void read_layer(
+        const torch::Tensor& descriptors,
+        const torch::Tensor& status,
+        const torch::Tensor& object_base_offsets,
+        int64_t first_plane,
+        int64_t region_id) {
+        check_io_tensors(descriptors, status, object_base_offsets);
+        c10::cuda::CUDAGuard guard(cuda_device_);
+        store_->read_layer_async(
+            reinterpret_cast<const ObjectDescriptor*>(
+                descriptors.data_ptr<uint8_t>()),
+            status.data_ptr<uint8_t>(),
+            reinterpret_cast<const uint64_t*>(
+                object_base_offsets.data_ptr<int64_t>()),
+            static_cast<uint32_t>(status.size(0)),
+            checked_u16(first_plane, "first_plane"),
+            checked_u32(region_id, "region_id", true),
+            at::cuda::getCurrentCUDAStream(cuda_device_).stream());
+    }
+
+    void write_layer(
+        const torch::Tensor& descriptors,
+        const torch::Tensor& status,
+        const torch::Tensor& object_base_offsets,
+        int64_t first_plane,
+        int64_t region_id) {
+        check_io_tensors(descriptors, status, object_base_offsets);
+        c10::cuda::CUDAGuard guard(cuda_device_);
+        store_->write_layer_async(
+            reinterpret_cast<const ObjectDescriptor*>(
+                descriptors.data_ptr<uint8_t>()),
+            status.data_ptr<uint8_t>(),
+            reinterpret_cast<const uint64_t*>(
+                object_base_offsets.data_ptr<int64_t>()),
+            static_cast<uint32_t>(status.size(0)),
+            checked_u16(first_plane, "first_plane"),
+            checked_u32(region_id, "region_id", true),
             at::cuda::getCurrentCUDAStream(cuda_device_).stream());
     }
 
@@ -235,12 +290,15 @@ private:
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     py::class_<ObjectStoreBinding>(module, "ObjectStore")
         .def(py::init<const std::string&, int64_t, int64_t, int64_t, int64_t,
-                      int64_t, int64_t, int64_t, int64_t, int64_t>())
+                      int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+                      int64_t, int64_t, int64_t, int64_t>())
         .def("register_region", &ObjectStoreBinding::register_region)
         .def("reserve", &ObjectStoreBinding::reserve)
         .def("resolve", &ObjectStoreBinding::resolve)
         .def("read_plane", &ObjectStoreBinding::read_plane)
         .def("write_plane", &ObjectStoreBinding::write_plane)
+        .def("read_layer", &ObjectStoreBinding::read_layer)
+        .def("write_layer", &ObjectStoreBinding::write_layer)
         .def("stats", &ObjectStoreBinding::stats)
         .def_property_readonly("plane_count", &ObjectStoreBinding::plane_count)
         .def_property_readonly("plane_bytes", &ObjectStoreBinding::plane_bytes)
