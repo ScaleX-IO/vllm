@@ -16,11 +16,16 @@ mkdir -p "$output_dir"
 read -r -a target_urls <<<"$TARGET_URLS"
 (( ${#target_urls[@]} > 0 )) || { echo "TARGET_URLS is empty" >&2; exit 2; }
 
+probe_args=()
+if [[ ${REQUIRE_PROMPT_CACHE_HIT:-0} == 1 ]]; then
+  probe_args+=(--require-prompt-cache-hit)
+fi
 "$python_bin" "$script_dir/workload.py" probe \
   --url "$PROBE_URL" --model "$MODEL" --tokenizer "$TOKENIZER" \
   --output "$output_dir/probe.json" \
   --decode-tokens "${PROBE_DECODE_TOKENS:-65}" \
-  --prompt-repetitions "${PROMPT_REPETITIONS:-80}"
+  --prompt-repetitions "${PROMPT_REPETITIONS:-80}" \
+  --block-size "${BLOCK_SIZE:-16}" "${probe_args[@]}"
 
 # Verify before the pressure phase so unrelated Store eviction cannot turn a
 # correctness test into a capacity test. CACHED_URL must not be PROBE_URL.

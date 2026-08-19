@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 import argparse
 import asyncio
 import json
@@ -41,10 +44,19 @@ async def probe(args: argparse.Namespace) -> None:
     )
     choice = result["choices"][0]
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+    prompt_token_ids = tokenizer.encode(prompt)
+    prompt_floor = len(prompt_token_ids) // args.block_size * args.block_size
+    cache_hit = cached_tokens(result)
+    if args.require_prompt_cache_hit and cache_hit < prompt_floor:
+        raise AssertionError(
+            f"D did not load the P-side prompt KV from Store: "
+            f"expected at least {prompt_floor} cached tokens, got {cache_hit}"
+        )
     payload = {
-        "prompt_token_ids": tokenizer.encode(prompt),
+        "prompt_token_ids": prompt_token_ids,
         "output_token_ids": choice["token_ids"],
         "text": choice["text"],
+        "cached_tokens": cache_hit,
     }
     args.output.write_text(json.dumps(payload), encoding="utf-8")
     print(json.dumps({"probe": "passed", **payload}, ensure_ascii=False))
@@ -115,7 +127,9 @@ async def verify(args: argparse.Namespace) -> None:
     reference_ids = reference["choices"][0]["token_ids"]
     if cached_ids != reference_ids:
         raise AssertionError(
-            f"cached continuation {cached_ids} != reference {reference_ids}"
+            f"cached continuation {cached_ids} != reference {reference_ids}; "
+            f"cached_tokens={cached_count}, prompt_tokens={len(prompt_ids)}, "
+            f"decode_tokens={len(probe_result['output_token_ids'])}"
         )
     print(
         json.dumps(
@@ -125,6 +139,44 @@ async def verify(args: argparse.Namespace) -> None:
                 "decode_tokens": len(probe_result["output_token_ids"]),
                 "cached_tokens": cached_count,
                 "continuation_token_ids": cached_ids,
+            }
+        )
+    )
+
+
+async def verify_recorded(args: argparse.Namespace) -> None:
+    """Verify Store KV using the last recorded decode token as reference."""
+    probe_result = json.loads(args.probe.read_text(encoding="utf-8"))
+    prompt_ids = probe_result["prompt_token_ids"]
+    output_ids = probe_result["output_token_ids"]
+    if len(output_ids) < 2:
+        raise AssertionError("probe must record at least two decode tokens")
+
+    # The final sampled token has not itself gone through a model forward. Use
+    # the preceding decode tokens as input and the final one as the reference.
+    request = base_payload(args.model, prompt_ids + output_ids[:-1], 1)
+    cached = await completion(args.cached_url, request, args.timeout)
+    cached_count = cached_tokens(cached)
+    prompt_floor = len(prompt_ids) // args.block_size * args.block_size
+    if cached_count < prompt_floor + args.block_size:
+        raise AssertionError(
+            f"expected decode KV hit beyond {prompt_floor}, got {cached_count}"
+        )
+    actual_ids = cached["choices"][0]["token_ids"]
+    expected_ids = output_ids[-1:]
+    if actual_ids != expected_ids:
+        raise AssertionError(
+            f"cached continuation {actual_ids} != recorded {expected_ids}; "
+            f"cached_tokens={cached_count}"
+        )
+    print(
+        json.dumps(
+            {
+                "verification": "passed",
+                "prompt_tokens": len(prompt_ids),
+                "decode_tokens": len(output_ids),
+                "cached_tokens": cached_count,
+                "continuation_token_ids": actual_ids,
             }
         )
     )
@@ -143,6 +195,8 @@ def parser() -> argparse.ArgumentParser:
     probe_parser.add_argument("--tokenizer", required=True)
     probe_parser.add_argument("--decode-tokens", type=int, default=65)
     probe_parser.add_argument("--prompt-repetitions", type=int, default=80)
+    probe_parser.add_argument("--block-size", type=int, default=16)
+    probe_parser.add_argument("--require-prompt-cache-hit", action="store_true")
     probe_parser.set_defaults(handler=probe)
 
     stress_parser = subparsers.add_parser("stress", parents=[common])
@@ -159,6 +213,12 @@ def parser() -> argparse.ArgumentParser:
     verify_parser.add_argument("--probe", type=Path, required=True)
     verify_parser.add_argument("--block-size", type=int, default=16)
     verify_parser.set_defaults(handler=verify)
+
+    recorded_parser = subparsers.add_parser("verify-recorded", parents=[common])
+    recorded_parser.add_argument("--cached-url", required=True)
+    recorded_parser.add_argument("--probe", type=Path, required=True)
+    recorded_parser.add_argument("--block-size", type=int, default=16)
+    recorded_parser.set_defaults(handler=verify_recorded)
     return root
 
 

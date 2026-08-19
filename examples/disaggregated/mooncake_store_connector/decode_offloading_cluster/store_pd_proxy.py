@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 import argparse
+import asyncio
 
 import httpx
 import uvicorn
 from fastapi import FastAPI, Request, Response
 
 
-def create_app(prefill_url: str, decode_url: str, timeout: float) -> FastAPI:
+def create_app(
+    prefill_url: str,
+    decode_url: str,
+    timeout: float,
+    prefill_store_wait: float,
+) -> FastAPI:
     app = FastAPI()
 
     @app.get("/health")
@@ -23,6 +32,12 @@ def create_app(prefill_url: str, decode_url: str, timeout: float) -> FastAPI:
                 f"{prefill_url}/v1/completions", json=prefill_payload
             )
             prefill.raise_for_status()
+            # The OpenAI response can precede the asynchronous Store PUT. This
+            # grace period avoids immediately racing the D-side lookup; the
+            # workload still requires a D-side cache hit, so it cannot hide a
+            # missing or failed PUT.
+            if prefill_store_wait:
+                await asyncio.sleep(prefill_store_wait)
             decode = await client.post(f"{decode_url}/v1/completions", json=payload)
         return Response(
             content=decode.content,
@@ -40,9 +55,15 @@ def main() -> None:
     parser.add_argument("--prefill-url", required=True)
     parser.add_argument("--decode-url", required=True)
     parser.add_argument("--timeout", type=float, default=300)
+    parser.add_argument("--prefill-store-wait", type=float, default=0)
     args = parser.parse_args()
     uvicorn.run(
-        create_app(args.prefill_url, args.decode_url, args.timeout),
+        create_app(
+            args.prefill_url,
+            args.decode_url,
+            args.timeout,
+            args.prefill_store_wait,
+        ),
         host=args.host,
         port=args.port,
     )
