@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -20,6 +21,7 @@ from vllm.v1.core.kv_cache_utils import (
     ExternalBlockHash,
     FreeKVCacheBlockQueue,
     KVCacheBlock,
+    PrefixAwareFreeKVCacheBlockQueue,
     generate_block_hash_extra_keys,
     get_block_hash,
     make_block_hash_with_group_id,
@@ -143,6 +145,9 @@ class BlockPool:
             actual block size can be a multiple of hash_block_size.
         enable_kv_cache_events: Whether to enable kv cache events.
         metrics_collector: Optional metrics collector for tracking block residency.
+        eviction_policy: Free-block eviction policy. ``lru`` preserves vLLM's
+            default behavior; ``prefix_aware`` adds reuse admission and bounded
+            protection while retaining suffix-first ordering.
     """
 
     def __init__(
@@ -152,6 +157,7 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        eviction_policy: str | None = None,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
@@ -164,7 +170,22 @@ class BlockPool:
         # Free block queue that constructs and manipulates a doubly linked
         # list of free blocks (including eviction candidates when caching is
         # enabled).
-        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        self.eviction_policy = eviction_policy or os.getenv(
+            "GPUKV_HBM_EVICTION_POLICY", "lru"
+        )
+        if self.eviction_policy == "lru":
+            self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        elif self.eviction_policy == "prefix_aware":
+            protected_ratio = float(
+                os.getenv("GPUKV_HBM_PROTECTED_RATIO", "0.8")
+            )
+            self.free_block_queue = PrefixAwareFreeKVCacheBlockQueue(
+                self.blocks, protected_ratio
+            )
+        else:
+            raise ValueError(
+                f"Unsupported KV cache eviction policy: {self.eviction_policy}"
+            )
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
@@ -269,6 +290,7 @@ class BlockPool:
             )
             blk.block_hash = block_hash_with_group_id
             self.cached_block_hash_to_block.insert(block_hash_with_group_id, blk)
+            self.free_block_queue.record_insert(blk)
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
 
@@ -337,6 +359,7 @@ class BlockPool:
         if self.enable_caching:
             for block in ret:
                 self._maybe_evict_cached_block(block)
+                block.eviction_segment = 0
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
                 if self.metrics_collector:
@@ -403,6 +426,7 @@ class BlockPool:
             if block.ref_cnt == 0 and not block.is_null:
                 self.free_block_queue.remove(block)
             block.ref_cnt += 1
+            self.free_block_queue.record_access(block)
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
 
@@ -462,9 +486,11 @@ class BlockPool:
         # Remove all hashes so that no new blocks will hit.
         self.cached_block_hash_to_block = BlockHashToBlockMap()
 
+        self.free_block_queue.reset_policy_state()
         # Remove all hashes from all blocks.
         for block in self.blocks:
             block.reset_hash()
+            block.eviction_segment = 0
 
         if self.metrics_collector:
             self.metrics_collector.reset()

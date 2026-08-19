@@ -24,6 +24,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     FreeKVCacheBlockQueue,
     KVCacheBlock,
+    PrefixAwareFreeKVCacheBlockQueue,
     estimate_max_model_len,
     generate_block_hash_extra_keys,
     generate_scheduler_kv_cache_config,
@@ -401,6 +402,77 @@ def test_free_kv_cache_block_queue_get_all_free_blocks():
     # Append a block back and check again
     queue.append(block_to_remove)
     assert queue.get_all_free_blocks() == blocks[1:2] + blocks[3:] + [block_to_remove]
+
+
+def test_prefix_aware_queue_protects_reused_blocks_from_scan_pollution():
+    blocks = [KVCacheBlock(block_id=i) for i in range(5)]
+    queue = PrefixAwareFreeKVCacheBlockQueue(blocks)
+
+    hot_block = blocks[0]
+    queue.remove(hot_block)
+    queue.record_access(hot_block)
+    queue.append(hot_block)
+
+    assert queue.popleft() is blocks[1]
+    assert hot_block in queue.get_all_free_blocks()
+    assert hot_block.eviction_segment == queue.PROTECTED
+
+
+def test_prefix_aware_queue_preserves_suffix_first_order():
+    suffix = KVCacheBlock(block_id=1)
+    middle = KVCacheBlock(block_id=2)
+    root = KVCacheBlock(block_id=3)
+    queue = PrefixAwareFreeKVCacheBlockQueue([])
+
+    queue.append_n([suffix, middle, root])
+
+    assert queue.popleft_n(3) == [suffix, middle, root]
+
+
+def test_prefix_aware_queue_ages_protected_blocks_for_phase_change():
+    blocks = [KVCacheBlock(block_id=i) for i in range(5)]
+    queue = PrefixAwareFreeKVCacheBlockQueue(blocks, protected_ratio=0.4)
+
+    for block in blocks[:3]:
+        queue.remove(block)
+        queue.record_access(block)
+        queue.append(block)
+
+    assert blocks[0].eviction_segment == queue.PROBATION
+    assert blocks[1].eviction_segment == queue.PROTECTED
+    assert blocks[2].eviction_segment == queue.PROTECTED
+    assert queue.get_all_free_blocks() == [
+        blocks[3],
+        blocks[4],
+        blocks[0],
+        blocks[1],
+        blocks[2],
+    ]
+
+
+def test_prefix_aware_queue_uses_ghost_history_for_readmission():
+    old_hash = make_block_hash_with_group_id(BlockHash(b"phase-b"), 0)
+    block = KVCacheBlock(block_id=0)
+    block.block_hash = old_hash
+    queue = PrefixAwareFreeKVCacheBlockQueue([block])
+
+    assert queue.popleft() is block
+    block.reset_hash()
+    block.block_hash = old_hash
+    queue.record_insert(block)
+    queue.append(block)
+
+    assert block.eviction_segment == queue.PROTECTED
+    assert queue.get_all_free_blocks() == [block]
+
+    queue.reset_policy_state()
+    assert block.eviction_segment == queue.PROBATION
+    assert queue.get_all_free_blocks() == [block]
+
+
+def test_prefix_aware_queue_rejects_invalid_protected_ratio():
+    with pytest.raises(ValueError, match="protected_ratio"):
+        PrefixAwareFreeKVCacheBlockQueue([], protected_ratio=1.0)
 
 
 def test_generate_block_hash_extra_keys():
