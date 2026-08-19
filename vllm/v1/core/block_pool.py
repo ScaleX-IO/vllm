@@ -21,7 +21,6 @@ from vllm.v1.core.kv_cache_utils import (
     ExternalBlockHash,
     FreeKVCacheBlockQueue,
     KVCacheBlock,
-    PrefixAwareFreeKVCacheBlockQueue,
     generate_block_hash_extra_keys,
     get_block_hash,
     make_block_hash_with_group_id,
@@ -145,9 +144,8 @@ class BlockPool:
             actual block size can be a multiple of hash_block_size.
         enable_kv_cache_events: Whether to enable kv cache events.
         metrics_collector: Optional metrics collector for tracking block residency.
-        eviction_policy: Free-block eviction policy. ``lru`` preserves vLLM's
-            default behavior; ``prefix_aware`` adds reuse admission and bounded
-            protection while retaining suffix-first ordering.
+        eviction_policy: ``lru`` uses vLLM's native order. ``score`` combines
+            recency and observed prefix reuse in one scalar per block.
     """
 
     def __init__(
@@ -163,6 +161,17 @@ class BlockPool:
         self.num_gpu_blocks = num_gpu_blocks
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
+        self.eviction_policy = eviction_policy or os.getenv(
+            "GPUKV_HBM_EVICTION_POLICY", "lru"
+        )
+        if self.eviction_policy not in ("lru", "score"):
+            raise ValueError(
+                f"Unsupported KV cache eviction policy: {self.eviction_policy}"
+            )
+        self._score_clock = 0
+        # A root-prefix hit receives a lease of two complete cache turnovers;
+        # progressively deeper quarters receive shorter leases.
+        self._score_base_lease = max(1, num_gpu_blocks // 4)
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
@@ -170,22 +179,7 @@ class BlockPool:
         # Free block queue that constructs and manipulates a doubly linked
         # list of free blocks (including eviction candidates when caching is
         # enabled).
-        self.eviction_policy = eviction_policy or os.getenv(
-            "GPUKV_HBM_EVICTION_POLICY", "lru"
-        )
-        if self.eviction_policy == "lru":
-            self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
-        elif self.eviction_policy == "prefix_aware":
-            protected_ratio = float(
-                os.getenv("GPUKV_HBM_PROTECTED_RATIO", "0.8")
-            )
-            self.free_block_queue = PrefixAwareFreeKVCacheBlockQueue(
-                self.blocks, protected_ratio
-            )
-        else:
-            raise ValueError(
-                f"Unsupported KV cache eviction policy: {self.eviction_policy}"
-            )
+        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
@@ -290,7 +284,6 @@ class BlockPool:
             )
             blk.block_hash = block_hash_with_group_id
             self.cached_block_hash_to_block.insert(block_hash_with_group_id, blk)
-            self.free_block_queue.record_insert(blk)
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
 
@@ -353,13 +346,16 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        if self.eviction_policy == "score":
+            ret = self.free_block_queue.popleft_n_by_score(num_blocks)
+        else:
+            ret = self.free_block_queue.popleft_n(num_blocks)
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
             for block in ret:
                 self._maybe_evict_cached_block(block)
-                block.eviction_segment = 0
+                block.eviction_score = 0
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
                 if self.metrics_collector:
@@ -398,6 +394,7 @@ class BlockPool:
             return False
 
         block.reset_hash()
+        block.eviction_score = 0
 
         if self.enable_kv_cache_events:
             # FIXME (Chen): Not sure whether we should return `hash_value`
@@ -420,13 +417,26 @@ class BlockPool:
         Args:
             blocks: A list of blocks to touch.
         """
-        for block in blocks:
+        score_now = 0
+        block_count = len(blocks)
+        if self.eviction_policy == "score" and block_count:
+            self._score_clock += 1
+            score_now = self._score_clock
+
+        for index, block in enumerate(blocks):
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
             if block.ref_cnt == 0 and not block.is_null:
                 self.free_block_queue.remove(block)
             block.ref_cnt += 1
-            self.free_block_queue.record_access(block)
+            if self.eviction_policy == "score" and not block.is_null:
+                remaining = block_count - index
+                priority = min(3, (remaining * 4 - 1) // block_count)
+                lease = self._score_base_lease << priority
+                block.eviction_score = max(
+                    block.eviction_score,
+                    score_now + lease,
+                )
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
 
@@ -442,9 +452,20 @@ class BlockPool:
         blocks_list = list(ordered_blocks)
         for block in blocks_list:
             block.ref_cnt -= 1
-        self.free_block_queue.append_n(
-            [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
-        )
+        free_blocks = [
+            block for block in blocks_list if block.ref_cnt == 0 and not block.is_null
+        ]
+        if self.eviction_policy == "score":
+            admitted = [
+                block
+                for block in free_blocks
+                if block.block_hash is not None and block.eviction_score == 0
+            ]
+            if admitted:
+                self._score_clock += len(admitted)
+                for block in admitted:
+                    block.eviction_score = self._score_clock
+        self.free_block_queue.append_n(free_blocks)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
@@ -486,11 +507,11 @@ class BlockPool:
         # Remove all hashes so that no new blocks will hit.
         self.cached_block_hash_to_block = BlockHashToBlockMap()
 
-        self.free_block_queue.reset_policy_state()
         # Remove all hashes from all blocks.
         for block in self.blocks:
             block.reset_hash()
-            block.eviction_segment = 0
+            block.eviction_score = 0
+        self._score_clock = 0
 
         if self.metrics_collector:
             self.metrics_collector.reset()

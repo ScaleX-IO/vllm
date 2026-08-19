@@ -5,10 +5,11 @@
 import copy
 import hashlib
 import os
-from collections import OrderedDict, defaultdict
+from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
+from heapq import nsmallest
 from typing import Any, NewType, TypeAlias, overload
 
 from vllm import envs
@@ -123,9 +124,9 @@ class KVCacheBlock:
     prev_free_block: "KVCacheBlock | None" = None
     next_free_block: "KVCacheBlock | None" = None
 
-    # Prefix-aware eviction uses a probation/protected admission bit. It is
-    # scheduler metadata only and does not allocate another KV value buffer.
-    eviction_segment: int = 0
+    # A single scalar encodes recency and prefix-reuse value for score-based
+    # eviction. It is scheduler metadata and consumes no KV-cache HBM.
+    eviction_score: int = 0
 
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
@@ -281,6 +282,24 @@ class FreeKVCacheBlockQueue:
             curr_block.prev_free_block = self.fake_free_list_head
         return ret
 
+    def popleft_n_by_score(self, n: int) -> list[KVCacheBlock]:
+        """Pop the lowest-score blocks, preserving LRU order for ties.
+
+        The existing linked list remains the only persistent eviction index.
+        ``nsmallest`` keeps only the requested candidates while scanning it.
+        """
+        if n == 0:
+            return []
+        assert self.num_free_blocks >= n
+        selected = nsmallest(
+            n,
+            self._iter_free_blocks(),
+            key=lambda block: block.eviction_score,
+        )
+        for block in selected:
+            self.remove(block)
+        return selected
+
     def remove(self, block: KVCacheBlock) -> None:
         """Remove a block in the free list and reduce num_free_blocks by 1.
 
@@ -349,148 +368,23 @@ class FreeKVCacheBlockQueue:
 
         self.num_free_blocks += len(blocks)
 
+    def _iter_free_blocks(self) -> Iterator[KVCacheBlock]:
+        curr_block = self.fake_free_list_head.next_free_block
+        if curr_block is None:
+            raise RuntimeError(
+                "next_free_block of fake_free_list_head should always exist"
+            )
+        while curr_block.next_free_block is not None:
+            yield curr_block
+            curr_block = curr_block.next_free_block
+
     def get_all_free_blocks(self) -> list[KVCacheBlock]:
         """Get all free blocks in the free list. Mainly used for testing.
 
         Returns:
             A list of free blocks.
         """
-        ret = []
-        if self.fake_free_list_head.next_free_block is None:
-            raise RuntimeError(
-                "next_free_block of fake_free_list_head should always exist"
-            )
-        # Start from the first block
-        curr_block: KVCacheBlock = self.fake_free_list_head.next_free_block
-        # As long as next_free_block is available, we haven't reached to
-        # the fake tail yet.
-        while curr_block.next_free_block is not None:
-            ret.append(curr_block)
-            curr_block = curr_block.next_free_block
-        return ret
-
-    def record_access(self, block: KVCacheBlock) -> None:
-        """Record an access for eviction policies that use reuse history."""
-
-    def record_insert(self, block: KVCacheBlock) -> None:
-        """Record a newly cached block for history-based admission."""
-
-    def reset_policy_state(self) -> None:
-        """Reset policy-specific ordering after the prefix cache is cleared."""
-
-
-class PrefixAwareFreeKVCacheBlockQueue:
-    """Scan-resistant online eviction queue for prefix-cached KV blocks.
-
-    New blocks enter probation and are promoted only after a later cache hit.
-    Probation candidates are evicted before protected candidates, preventing a
-    one-time context scan from replacing repeatedly reused prefixes. A bounded
-    protected segment continuously demotes its oldest blocks, which ages past
-    popularity. A bounded ghost history admits blocks seen again after eviction,
-    allowing a new hot set larger than probation to take over. Within each
-    segment, callers' suffix-first free order is preserved.
-    """
-
-    PROBATION = 0
-    PROTECTED = 1
-
-    def __init__(
-        self,
-        blocks: list[KVCacheBlock],
-        protected_ratio: float = 0.8,
-    ) -> None:
-        if not 0 < protected_ratio < 1:
-            raise ValueError("protected_ratio must be between 0 and 1")
-        for block in blocks:
-            block.eviction_segment = self.PROBATION
-        self._probation = FreeKVCacheBlockQueue(blocks)
-        self._protected = FreeKVCacheBlockQueue([])
-        self.num_free_blocks = len(blocks)
-        self._protected_limit = (
-            max(1, int(len(blocks) * protected_ratio)) if blocks else 0
-        )
-        self._ghost_limit = len(blocks)
-        self._ghost: OrderedDict[BlockHashWithGroupId, None] = OrderedDict()
-
-    def _remember_evictions(self, blocks: list[KVCacheBlock]) -> None:
-        for block in blocks:
-            if block.block_hash is not None:
-                self._ghost[block.block_hash] = None
-                self._ghost.move_to_end(block.block_hash)
-        while len(self._ghost) > self._ghost_limit:
-            self._ghost.popitem(last=False)
-
-    def popleft(self) -> KVCacheBlock:
-        if self.num_free_blocks == 0:
-            raise ValueError("No free blocks available")
-        return self.popleft_n(1)[0]
-
-    def popleft_n(self, n: int) -> list[KVCacheBlock]:
-        if n == 0:
-            return []
-        assert self.num_free_blocks >= n
-        probation_count = min(n, self._probation.num_free_blocks)
-        probation = self._probation.popleft_n(probation_count)
-        self._remember_evictions(probation)
-        protected = self._protected.popleft_n(n - probation_count)
-        self.num_free_blocks -= n
-        return probation + protected
-
-    def remove(self, block: KVCacheBlock) -> None:
-        queue = (
-            self._protected
-            if block.eviction_segment == self.PROTECTED
-            else self._probation
-        )
-        queue.remove(block)
-        self.num_free_blocks -= 1
-
-    def append(self, block: KVCacheBlock) -> None:
-        self.append_n([block])
-
-    def append_n(self, blocks: list[KVCacheBlock]) -> None:
-        probation = []
-        protected = []
-        for block in blocks:
-            if block.eviction_segment == self.PROTECTED:
-                protected.append(block)
-            else:
-                probation.append(block)
-        self._probation.append_n(probation)
-        self._protected.append_n(protected)
-        self.num_free_blocks += len(blocks)
-        self._rebalance()
-
-    def record_access(self, block: KVCacheBlock) -> None:
-        block.eviction_segment = self.PROTECTED
-
-    def record_insert(self, block: KVCacheBlock) -> None:
-        block_hash = block.block_hash
-        if block_hash is not None and block_hash in self._ghost:
-            self._ghost.pop(block_hash)
-            block.eviction_segment = self.PROTECTED
-
-    def _rebalance(self) -> None:
-        excess = self._protected.num_free_blocks - self._protected_limit
-        if excess <= 0:
-            return
-        demoted = self._protected.popleft_n(excess)
-        for block in demoted:
-            block.eviction_segment = self.PROBATION
-        self._probation.append_n(demoted)
-
-    def reset_policy_state(self) -> None:
-        protected = self._protected.popleft_n(self._protected.num_free_blocks)
-        for block in protected:
-            block.eviction_segment = self.PROBATION
-        self._probation.append_n(protected)
-        self._ghost.clear()
-
-    def get_all_free_blocks(self) -> list[KVCacheBlock]:
-        return (
-            self._probation.get_all_free_blocks()
-            + self._protected.get_all_free_blocks()
-        )
+        return list(self._iter_free_blocks())
 
 
 def need_extra_keys(request: Request) -> bool:
