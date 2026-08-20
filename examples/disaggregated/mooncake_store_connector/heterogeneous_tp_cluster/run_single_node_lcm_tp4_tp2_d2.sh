@@ -1,12 +1,4 @@
 #!/usr/bin/env bash
-#SBATCH --partition=h20
-#SBATCH --nodes=1
-#SBATCH --nodelist=vllm-h20-02
-#SBATCH --gres=gpu:h20:8
-#SBATCH --cpus-per-task=128
-#SBATCH --time=02:00:00
-#SBATCH --job-name=tp-lcm-p4-p2-d2
-#SBATCH --output=/home/felixlinker/tp-lcm-p4-p2-d2-%j.out
 
 set -euo pipefail
 ulimit -l unlimited
@@ -17,11 +9,12 @@ scripts=$tests/examples/disaggregated/mooncake_store_connector/heterogeneous_tp_
 venv=${VENV_ROOT:-/home/felixlinker/.venv}
 model=${MODEL_PATH:-/mnt/nvme/shared/felixlinker/models/Qwen3-32B-FP8}
 served=tp-lcm-p4-p2-d2
-result_root=${RESULT_ROOT:-/home/felixlinker/tp-lcm-p4-p2-d2-$SLURM_JOB_ID}
+run_id=${RUN_ID:-$(date +%Y%m%d-%H%M%S)-$$}
+result_root=${RESULT_ROOT:-/home/felixlinker/tp-lcm-p4-p2-d2-$run_id}
 mkdir -p "$result_root/logs"
 
 host_ip=$(hostname -I | awk '{print $1}')
-port_base=$((52000 + (SLURM_JOB_ID % 100) * 10))
+port_base=${PORT_BASE:-$((52000 + ($$ % 100) * 10))}
 master_port=$port_base
 metadata_port=$((port_base + 1))
 store_port=$((port_base + 2))
@@ -29,7 +22,7 @@ prefill4_port=$((port_base + 3))
 prefill2_port=$((port_base + 4))
 decode_port=$((port_base + 5))
 metrics_port=$((port_base + 6))
-cache_prefix=tp-lcm-p4-p2-d2-$SLURM_JOB_ID
+cache_prefix=tp-lcm-p4-p2-d2-$run_id
 prefill4_gpus=${PREFILL4_GPUS:-0,1,2,3}
 prefill2_gpus=${PREFILL2_GPUS:-4,5}
 decode_gpus=${DECODE_GPUS:-6,7}

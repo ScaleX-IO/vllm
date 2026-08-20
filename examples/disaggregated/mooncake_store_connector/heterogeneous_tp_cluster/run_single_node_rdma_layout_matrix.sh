@@ -1,12 +1,4 @@
 #!/usr/bin/env bash
-#SBATCH --partition=h20
-#SBATCH --nodes=1
-#SBATCH --nodelist=vllm-h20-02
-#SBATCH --gres=gpu:h20:8
-#SBATCH --cpus-per-task=128
-#SBATCH --time=03:00:00
-#SBATCH --job-name=tp-layout-rdma-matrix
-#SBATCH --output=/home/felixlinker/tp-layout-rdma-matrix-%j.out
 
 set -euo pipefail
 ulimit -l unlimited
@@ -17,12 +9,13 @@ scripts=$tests/examples/disaggregated/mooncake_store_connector/heterogeneous_tp_
 venv=${VENV_ROOT:-/home/felixlinker/.venv}
 model=${MODEL_PATH:-/mnt/nvme/shared/felixlinker/models/Qwen3-32B-FP8}
 served=heterogeneous-tp-rdma-matrix
-result_root=${RESULT_ROOT:-/home/felixlinker/tp-layout-rdma-matrix-$SLURM_JOB_ID}
+run_id=${RUN_ID:-$(date +%Y%m%d-%H%M%S)-$$}
+result_root=${RESULT_ROOT:-/home/felixlinker/tp-layout-rdma-matrix-$run_id}
 only_case=${ONLY_CASE:-}
 mkdir -p "$result_root"
 
 host_ip=$(hostname -I | awk '{print $1}')
-port_base=$((48000 + (SLURM_JOB_ID % 50) * 200))
+port_base=${PORT_BASE:-$((48000 + ($$ % 50) * 200))}
 
 export PYTHONPATH=$feature
 export PATH=$venv/bin:$PATH
@@ -91,7 +84,7 @@ run_case() {
   local consumer_port=$((master_port + 4))
   local reference_port=$((master_port + 5))
   local metrics_port=$((master_port + 6))
-  local cache_prefix=tp-layout-rdma-$label-$SLURM_JOB_ID
+  local cache_prefix=tp-layout-rdma-$label-$run_id
   local producer_gpus consumer_gpus reference_gpus
 
   if [[ -n $only_case && $label != "$only_case" ]]; then
