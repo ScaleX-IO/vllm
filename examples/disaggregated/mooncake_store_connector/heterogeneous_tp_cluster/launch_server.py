@@ -18,6 +18,9 @@ def main() -> None:
     parser.add_argument("--tensor-parallel-size", type=int, required=True)
     parser.add_argument("--pipeline-parallel-size", type=int, default=1)
     parser.add_argument("--store-tp-size", type=int)
+    parser.add_argument("--enable-store-tp-lcm", action="store_true")
+    parser.add_argument("--prefill-tp-sizes", type=int, nargs="+")
+    parser.add_argument("--save-decode-cache", action="store_true")
     parser.add_argument("--cache-prefix", default="")
     parser.add_argument("--lookup-rpc-port", type=int)
     parser.add_argument("--block-size", type=int, default=16)
@@ -28,13 +31,27 @@ def main() -> None:
     parser.add_argument("--disable-flashinfer-autotune", action="store_true")
     args = parser.parse_args()
 
-    if args.role != "reference" and args.store_tp_size is None:
-        parser.error("--store-tp-size is required for Store roles")
+    if args.role != "reference":
+        if args.enable_store_tp_lcm:
+            if args.store_tp_size is not None:
+                parser.error(
+                    "--store-tp-size cannot be combined with --enable-store-tp-lcm"
+                )
+            if not args.prefill_tp_sizes:
+                parser.error(
+                    "--prefill-tp-sizes is required with --enable-store-tp-lcm"
+                )
+        elif args.store_tp_size is None:
+            parser.error(
+                "--store-tp-size or --enable-store-tp-lcm is required for Store roles"
+            )
+    elif args.save_decode_cache:
+        parser.error("--save-decode-cache is only valid for Store roles")
 
     os.environ.setdefault("PYTHONHASHSEED", "0")
     if args.kv_cache_layout:
         os.environ["VLLM_KV_CACHE_LAYOUT"] = args.kv_cache_layout
-    if args.role == "producer":
+    if args.role != "reference":
         os.environ["VLLM_SERVER_DEV_MODE"] = "1"
 
     command = [
@@ -70,8 +87,14 @@ def main() -> None:
     if args.role != "reference":
         extra_config: dict[str, object] = {
             "cache_prefix": args.cache_prefix,
-            "store_tp_size": args.store_tp_size,
         }
+        if args.enable_store_tp_lcm:
+            extra_config["enable_store_tp_lcm"] = True
+            extra_config["prefill_tp_sizes"] = args.prefill_tp_sizes
+        else:
+            extra_config["store_tp_size"] = args.store_tp_size
+        if args.save_decode_cache:
+            extra_config["save_decode_cache"] = True
         if args.lookup_rpc_port is not None:
             extra_config["lookup_rpc_port"] = args.lookup_rpc_port
         config = {

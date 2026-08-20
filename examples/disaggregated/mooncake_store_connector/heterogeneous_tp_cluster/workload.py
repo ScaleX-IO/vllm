@@ -34,7 +34,7 @@ def prompt_for(index: int, repetitions: int, group: str) -> str:
     )
 
 
-def payload(model: str, prompt: str, output_tokens: int) -> dict:
+def payload(model: str, prompt: str | list[int], output_tokens: int) -> dict:
     return {
         "model": model,
         "prompt": prompt,
@@ -72,6 +72,13 @@ async def token_lengths(tokenizer_name: str, prompts: list[str]) -> list[int]:
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
     return [len(tokenizer.encode(prompt)) for prompt in prompts]
+
+
+async def encode_prompts(tokenizer_name: str, prompts: list[str]) -> list[list[int]]:
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    return [tokenizer.encode(prompt) for prompt in prompts]
 
 
 async def wait_until_store_jobs_finish(
@@ -148,6 +155,95 @@ async def functional(args: argparse.Namespace) -> None:
                 "cached_tokens": actual_hit,
                 "output_tokens": len(cached_ids),
                 "reference_tokens_match": tokens_match,
+            }
+        )
+    )
+
+
+async def lcm_multi_prefill(args: argparse.Namespace) -> None:
+    prompts = [
+        prompt_for(0, args.prompt_repetitions, "lcm-first"),
+        prompt_for(1, args.prompt_repetitions, "lcm-second"),
+    ]
+    prompt_ids = await encode_prompts(args.tokenizer, prompts)
+    limits = httpx.Limits(max_connections=8)
+
+    async with httpx.AsyncClient(timeout=args.request_timeout, limits=limits) as client:
+
+        async def verify_direction(
+            seed_url: str,
+            verify_url: str,
+            prompt: str,
+            ids: list[int],
+            label: str,
+        ) -> dict[str, int]:
+            await completion(client, seed_url, payload(args.model, prompt, 1))
+            await wait_until_store_jobs_finish(
+                client, seed_url, args.visibility_timeout
+            )
+
+            decoded = await completion(
+                client,
+                args.decode_url,
+                payload(args.model, ids, args.decode_tokens),
+            )
+            base_expected = cacheable_prompt_tokens(len(ids), args.block_size)
+            decode_hit = cached_tokens(decoded)
+            if decode_hit < base_expected:
+                raise AssertionError(
+                    f"{label}: decode missed the prefill prefix: "
+                    f"expected {base_expected}, got {decode_hit}"
+                )
+
+            decoded_ids = decoded["choices"][0]["token_ids"]
+            if not isinstance(decoded_ids, list) or not decoded_ids:
+                raise AssertionError(f"{label}: decode returned no token ids")
+            await wait_until_store_jobs_finish(
+                client, args.decode_url, args.visibility_timeout
+            )
+
+            extended_ids = ids + decoded_ids
+            verified = await completion(
+                client, verify_url, payload(args.model, extended_ids, 1)
+            )
+            extended_cacheable = cacheable_prompt_tokens(
+                len(extended_ids), args.block_size
+            )
+            extended_hit = cached_tokens(verified)
+            if extended_hit <= base_expected:
+                raise AssertionError(
+                    f"{label}: cache hit did not extend beyond the original "
+                    f"prefill prefix ({extended_hit} <= {base_expected})"
+                )
+            return {
+                "prompt_tokens": len(ids),
+                "decode_cached_tokens": decode_hit,
+                "decode_output_tokens": len(decoded_ids),
+                "extended_cached_tokens": extended_hit,
+                "extended_cacheable_tokens": extended_cacheable,
+            }
+
+        first_to_second = await verify_direction(
+            args.prefill_first_url,
+            args.prefill_second_url,
+            prompts[0],
+            prompt_ids[0],
+            "first-prefill-to-second-prefill",
+        )
+        second_to_first = await verify_direction(
+            args.prefill_second_url,
+            args.prefill_first_url,
+            prompts[1],
+            prompt_ids[1],
+            "second-prefill-to-first-prefill",
+        )
+
+    print(
+        json.dumps(
+            {
+                "verification": "passed",
+                "first_prefill_to_second_prefill": first_to_second,
+                "second_prefill_to_first_prefill": second_to_first,
             }
         )
     )
@@ -363,6 +459,19 @@ def parser() -> argparse.ArgumentParser:
     functional_parser.add_argument("--reference-url", required=True)
     functional_parser.add_argument("--allow-token-mismatch", action="store_true")
     functional_parser.set_defaults(handler=functional)
+
+    lcm_parser = commands.add_parser("lcm-multi-prefill")
+    lcm_parser.add_argument("--prefill-first-url", required=True)
+    lcm_parser.add_argument("--prefill-second-url", required=True)
+    lcm_parser.add_argument("--decode-url", required=True)
+    lcm_parser.add_argument("--model", required=True)
+    lcm_parser.add_argument("--tokenizer", required=True)
+    lcm_parser.add_argument("--block-size", type=int, default=16)
+    lcm_parser.add_argument("--prompt-repetitions", type=int, default=80)
+    lcm_parser.add_argument("--decode-tokens", type=int, default=64)
+    lcm_parser.add_argument("--visibility-timeout", type=float, default=300)
+    lcm_parser.add_argument("--request-timeout", type=float, default=300)
+    lcm_parser.set_defaults(handler=lcm_multi_prefill)
 
     performance_parser = commands.add_parser("performance", parents=[common])
     performance_parser.add_argument("--requests", type=int, default=64)

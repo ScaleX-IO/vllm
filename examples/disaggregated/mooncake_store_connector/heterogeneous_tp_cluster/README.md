@@ -42,6 +42,17 @@ The surrounding runner is responsible for process placement, GPU visibility,
 RDMA configuration, Mooncake capacity, unique ports, memory-lock limits, and
 checking that each service remains alive while waiting for `/health`.
 
+For multiple prefill TP sizes, replace `--store-tp-size` on every Store
+endpoint with the same opt-in configuration:
+
+```text
+--enable-store-tp-lcm --prefill-tp-sizes 4 2
+```
+
+This selects Store TP `lcm(4, 2) = 4`; it does not change either server's
+runtime TP. Add `--save-decode-cache` to the decode endpoint so newly completed
+decode blocks are written back in the same Store layout.
+
 ## Functional test
 
 ```bash
@@ -95,3 +106,16 @@ throughput. `rpc_throughput_gib_s` excludes vLLM scheduling and KV placement;
 metrics. Run
 correctness before performance and provision enough Store capacity so eviction
 is not part of this test.
+
+## Single-node RDMA runners
+
+`run_single_node_rdma_layout_matrix.slurm` is the portable eight-case layout
+matrix for P4 -> D2 and P2 -> D1. It accepts `FEATURE_ROOT`, `TEST_ROOT`,
+`VENV_ROOT`, `MODEL_PATH`, and `RESULT_ROOT` overrides.
+
+`run_single_node_lcm_tp4_tp2_d2.slurm` is the focused common-Store-TP test. It
+starts P4/HND, P2/NHD, and D2/NHD together on eight GPUs. The test first writes
+a prefix at P4, extends it through decode offloading at D2, and reads the
+extended prefix at P2. It then repeats the reverse P2 -> D2 -> P4 direction
+with a distinct prompt. Both final reads must hit beyond the original prefill
+prefix.
