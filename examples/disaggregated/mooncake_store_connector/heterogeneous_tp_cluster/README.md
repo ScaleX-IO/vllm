@@ -109,13 +109,13 @@ is not part of this test.
 
 ## Single-node RDMA runners
 
-`run_single_node_rdma_layout_matrix.sh` is the portable eight-case layout
-matrix for P4 -> D2 and P2 -> D1. It accepts `FEATURE_ROOT`, `TEST_ROOT`,
+`run_single_node_rdma_layout_matrix.sh` is the HND topology matrix for
+P4 -> D2 and P2 -> D1. It accepts `FEATURE_ROOT`, `TEST_ROOT`,
 `VENV_ROOT`, `MODEL_PATH`, `RESULT_ROOT`, `RUN_ID`, `PORT_BASE`, and
 `ONLY_CASE` overrides.
 
 `run_single_node_lcm_tp4_tp2_d2.sh` is the focused common-Store-TP test. It
-starts P4/HND, P2/NHD, and D2/NHD together on eight GPUs. The test first writes
+starts P4/HND, P2/HND, and D2/HND together on eight GPUs. The test first writes
 a prefix at P4, extends it through decode offloading at D2, and reads the
 extended prefix at P2. It then repeats the reverse P2 -> D2 -> P4 direction
 with a distinct prompt. Both final reads must hit beyond the original prefill
