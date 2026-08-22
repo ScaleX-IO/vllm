@@ -26,7 +26,7 @@ def main() -> None:
     parser.add_argument("--block-size", type=int, default=16)
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
-    parser.add_argument("--kv-cache-layout", choices=("NHD", "HND"))
+    parser.add_argument("--kv-cache-layout", choices=("LBNHC", "LBHNC"))
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--disable-flashinfer-autotune", action="store_true")
     args = parser.parse_args()

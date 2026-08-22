@@ -188,7 +188,7 @@ case_index=0
 for producer_tp_decode_tp in 4:2 2:1; do
   producer_tp=${producer_tp_decode_tp%:*}
   decode_tp=${producer_tp_decode_tp#*:}
-  run_case "$producer_tp" "$decode_tp" HND HND "$case_index"
+  run_case "$producer_tp" "$decode_tp" LBHNC LBHNC "$case_index"
   case_index=$((case_index + 1))
 done
 

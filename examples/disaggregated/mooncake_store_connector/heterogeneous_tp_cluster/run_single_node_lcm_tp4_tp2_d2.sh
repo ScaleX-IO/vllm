@@ -115,7 +115,7 @@ start "$result_root/logs/prefill4.log" \
   env CUDA_VISIBLE_DEVICES="$prefill4_gpus" VLLM_HOST_IP="$host_ip" \
   "$venv/bin/python" "$scripts/launch_server.py" --role producer \
   --port "$prefill4_port" --lookup-rpc-port "$prefill4_port" \
-  --tensor-parallel-size 4 --kv-cache-layout HND \
+  --tensor-parallel-size 4 --kv-cache-layout LBHNC \
   --gpu-memory-utilization "$prefill4_gpu_memory" "${common_args[@]}"
 prefill4_pid=${pids[-1]}
 wait_url "$prefill4_pid" "http://$host_ip:$prefill4_port" \
@@ -125,7 +125,7 @@ start "$result_root/logs/prefill2.log" \
   env CUDA_VISIBLE_DEVICES="$prefill2_gpus" VLLM_HOST_IP="$host_ip" \
   "$venv/bin/python" "$scripts/launch_server.py" --role producer \
   --port "$prefill2_port" --lookup-rpc-port "$prefill2_port" \
-  --tensor-parallel-size 2 --kv-cache-layout HND \
+  --tensor-parallel-size 2 --kv-cache-layout LBHNC \
   --gpu-memory-utilization "$prefill2_gpu_memory" "${common_args[@]}"
 prefill2_pid=${pids[-1]}
 wait_url "$prefill2_pid" "http://$host_ip:$prefill2_port" \
@@ -135,7 +135,7 @@ start "$result_root/logs/decode2.log" \
   env CUDA_VISIBLE_DEVICES="$decode_gpus" VLLM_HOST_IP="$host_ip" \
   "$venv/bin/python" "$scripts/launch_server.py" --role consumer \
   --port "$decode_port" --lookup-rpc-port "$decode_port" \
-  --tensor-parallel-size 2 --kv-cache-layout HND --save-decode-cache \
+  --tensor-parallel-size 2 --kv-cache-layout LBHNC --save-decode-cache \
   --gpu-memory-utilization "$decode_gpu_memory" "${common_args[@]}"
 decode_pid=${pids[-1]}
 wait_url "$decode_pid" "http://$host_ip:$decode_port" \
