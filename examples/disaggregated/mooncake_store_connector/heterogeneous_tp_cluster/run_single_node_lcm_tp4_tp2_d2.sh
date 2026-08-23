@@ -9,6 +9,7 @@ scripts=$tests/examples/disaggregated/mooncake_store_connector/heterogeneous_tp_
 venv=${VENV_ROOT:-/home/felixlinker/.venv}
 model=${MODEL_PATH:-/mnt/nvme/shared/felixlinker/models/Qwen3-32B-FP8}
 served=tp-lcm-p4-p2-d2
+layout=${KV_CACHE_LAYOUT:-LBHNC}
 run_id=${RUN_ID:-$(date +%Y%m%d-%H%M%S)-$$}
 result_root=${RESULT_ROOT:-/home/felixlinker/tp-lcm-p4-p2-d2-$run_id}
 mkdir -p "$result_root/logs"
@@ -115,7 +116,7 @@ start "$result_root/logs/prefill4.log" \
   env CUDA_VISIBLE_DEVICES="$prefill4_gpus" VLLM_HOST_IP="$host_ip" \
   "$venv/bin/python" "$scripts/launch_server.py" --role producer \
   --port "$prefill4_port" --lookup-rpc-port "$prefill4_port" \
-  --tensor-parallel-size 4 --kv-cache-layout LBHNC \
+  --tensor-parallel-size 4 --kv-cache-layout "$layout" \
   --gpu-memory-utilization "$prefill4_gpu_memory" "${common_args[@]}"
 prefill4_pid=${pids[-1]}
 wait_url "$prefill4_pid" "http://$host_ip:$prefill4_port" \
@@ -125,7 +126,7 @@ start "$result_root/logs/prefill2.log" \
   env CUDA_VISIBLE_DEVICES="$prefill2_gpus" VLLM_HOST_IP="$host_ip" \
   "$venv/bin/python" "$scripts/launch_server.py" --role producer \
   --port "$prefill2_port" --lookup-rpc-port "$prefill2_port" \
-  --tensor-parallel-size 2 --kv-cache-layout LBHNC \
+  --tensor-parallel-size 2 --kv-cache-layout "$layout" \
   --gpu-memory-utilization "$prefill2_gpu_memory" "${common_args[@]}"
 prefill2_pid=${pids[-1]}
 wait_url "$prefill2_pid" "http://$host_ip:$prefill2_port" \
@@ -135,7 +136,7 @@ start "$result_root/logs/decode2.log" \
   env CUDA_VISIBLE_DEVICES="$decode_gpus" VLLM_HOST_IP="$host_ip" \
   "$venv/bin/python" "$scripts/launch_server.py" --role consumer \
   --port "$decode_port" --lookup-rpc-port "$decode_port" \
-  --tensor-parallel-size 2 --kv-cache-layout LBHNC --save-decode-cache \
+  --tensor-parallel-size 2 --kv-cache-layout "$layout" --save-decode-cache \
   --gpu-memory-utilization "$decode_gpu_memory" "${common_args[@]}"
 decode_pid=${pids[-1]}
 wait_url "$decode_pid" "http://$host_ip:$decode_port" \

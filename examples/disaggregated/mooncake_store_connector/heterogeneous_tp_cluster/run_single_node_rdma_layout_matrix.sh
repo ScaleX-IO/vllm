@@ -12,6 +12,7 @@ served=heterogeneous-tp-rdma-matrix
 run_id=${RUN_ID:-$(date +%Y%m%d-%H%M%S)-$$}
 result_root=${RESULT_ROOT:-/home/felixlinker/tp-layout-rdma-matrix-$run_id}
 only_case=${ONLY_CASE:-}
+layouts=${LAYOUTS:-"LBHNC LBNHC"}
 mkdir -p "$result_root"
 
 host_ip=$(hostname -I | awk '{print $1}')
@@ -188,8 +189,10 @@ case_index=0
 for producer_tp_decode_tp in 4:2 2:1; do
   producer_tp=${producer_tp_decode_tp%:*}
   decode_tp=${producer_tp_decode_tp#*:}
-  run_case "$producer_tp" "$decode_tp" LBHNC LBHNC "$case_index"
-  case_index=$((case_index + 1))
+  for layout in $layouts; do
+    run_case "$producer_tp" "$decode_tp" "$layout" "$layout" "$case_index"
+    case_index=$((case_index + 1))
+  done
 done
 
 printf '%s\n' "$result_root" >"$result_root/RESULT_PATH"
