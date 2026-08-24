@@ -18,6 +18,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorRole,
     KVConnectorWorkerMetadata,
+    KVLoadRange,
     SupportsHMA,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
@@ -46,6 +47,7 @@ logger = init_logger(__name__)
 class MultiKVConnectorMetadata(KVConnectorMetadata):
     metadata: tuple[KVConnectorMetadata, ...]
     extra_async_saves: dict[str, int] | None = None
+    pending_async_loads: dict[str, tuple[int, ...]] | None = None
 
 
 @dataclass
@@ -129,10 +131,12 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
     """
     A wrapper for using multiple KVConnectors at the same time.
 
-    The current logic is:
-    - Load KV from the first connector that advertises available tokens from
-      get_num_new_matched_tokens(), based on the order in the config.
+    The default logic is:
+    - Load KV from the first connector that advertises available tokens.
     - Save to all connectors.
+
+    With ``load_policy=piecewise_prefix``, one connector may load a leading
+    prefix range and a later connector may load its suffix.
     """
 
     @classmethod
@@ -185,6 +189,9 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
             self._ktc_kv_transfer_config.append(temp_config.kv_transfer_config)
 
         assert vllm_config.kv_transfer_config is not None
+        extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
+        self._piecewise_load = extra_config.get("load_policy") == "piecewise_prefix"
+        self._block_size = vllm_config.cache_config.block_size
         self._all_support_hma = MultiConnector.all_children_support_hma(
             vllm_config.kv_transfer_config
         )
@@ -196,11 +203,15 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         # A mapping from request id to the index of the connector chosen to
         # load the request from (if any).
         self._requests_to_connector: dict[str, int] = {}
+        if self._piecewise_load:
+            self._request_load_ranges: dict[str, dict[int, KVLoadRange]] = {}
+            self._request_async_loads: dict[str, tuple[int, ...]] = {}
+            self._async_loads_to_send: dict[str, tuple[int, ...]] = {}
+            self._pending_async_loads: dict[str, set[int]] = {}
 
         # Keeps track of *additional* remaining async saves (beyond 1) to be
-        # finished per request. Not needed for async loads since we only allow
-        # a single connector to load.
-        # Propagated from scheduler to worker side via the connector metadata.
+        # finished per request. Propagated from scheduler to worker side via
+        # the connector metadata.
         self._extra_async_saves: dict[str, int] = {}
 
     @property
@@ -258,6 +269,15 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         assert isinstance(connector_metadata, MultiKVConnectorMetadata)
         if connector_metadata.extra_async_saves:
             self._extra_async_saves.update(connector_metadata.extra_async_saves)
+        if self._piecewise_load and connector_metadata.pending_async_loads:
+            self._pending_async_loads.update(
+                {
+                    req_id: set(connector_ids)
+                    for req_id, connector_ids in (
+                        connector_metadata.pending_async_loads.items()
+                    )
+                }
+            )
         for c, cm in zip(self._connectors, connector_metadata.metadata):
             c.bind_connector_metadata(cm)
         super().bind_connector_metadata(connector_metadata)
@@ -310,12 +330,26 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> tuple[set[str] | None, set[str] | None]:
         finished_sending: set[str] = set()
         finished_recving: set[str] = set()
-        for c in self._connectors:
+        if self._piecewise_load and self._pending_async_loads:
+            for req_id in finished_req_ids:
+                self._pending_async_loads.pop(req_id, None)
+
+        for i, c in enumerate(self._connectors):
             sending, recving = c.get_finished(finished_req_ids)
             if not recving and not sending:
                 continue
-            # Aggregate finished recving request ids.
-            finished_recving.update(recving or ())
+            if not self._piecewise_load:
+                finished_recving.update(recving or ())
+            else:
+                for req_id in recving or ():
+                    pending = self._pending_async_loads.get(req_id)
+                    if pending is None:
+                        finished_recving.add(req_id)
+                        continue
+                    pending.discard(i)
+                    if not pending:
+                        del self._pending_async_loads[req_id]
+                        finished_recving.add(req_id)
             # Aggregate finished sending request ids - only include
             # once we've drained the "extra" count (for cases where
             # more than one connector is async-saving the same request).
@@ -389,8 +423,25 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         request: "Request",
         num_computed_tokens: int,
     ) -> tuple[int | None, bool]:
-        to_return = (0, False)
-        for i, c in enumerate(self._connectors):
+        if not self._piecewise_load:
+            to_return = (0, False)
+            for i, c in enumerate(self._connectors):
+                toks, load_async = c.get_num_new_matched_tokens(
+                    request, num_computed_tokens
+                )
+                if toks is None:
+                    return (None, False)
+                if to_return[0] == 0 and toks > 0:
+                    self._requests_to_connector[request.request_id] = i
+                    to_return = (toks, load_async)
+            return to_return
+
+        req_id = request.request_id
+        self._requests_to_connector.pop(req_id, None)
+        self._request_load_ranges.pop(req_id, None)
+        self._request_async_loads.pop(req_id, None)
+        matches: list[tuple[int, bool]] = []
+        for c in self._connectors:
             toks, load_async = c.get_num_new_matched_tokens(
                 request, num_computed_tokens
             )
@@ -398,17 +449,76 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
             # we return None to indicate that we are not done yet.
             if toks is None:
                 return (None, False)
-            # The first connector that has new matched tokens will be assigned
-            # to this request.
-            if to_return[0] == 0 and toks > 0:
-                self._requests_to_connector[request.request_id] = i
-                to_return = (toks, load_async)
-        return to_return
+            matches.append((toks, load_async))
+
+        covered = num_computed_tokens
+        ranges: dict[int, KVLoadRange] = {}
+        async_loads: list[int] = []
+        for i, ((toks, load_async), connector) in enumerate(
+            zip(matches, self._connectors)
+        ):
+            endpoint = num_computed_tokens + toks
+            if endpoint <= covered:
+                continue
+            if len(ranges) == 2:
+                return self._select_single_load(req_id, matches)
+            if ranges and (
+                not connector.supports_piecewise_load
+                or covered % self._block_size
+                or endpoint % self._block_size
+            ):
+                return self._select_single_load(req_id, matches)
+            ranges[i] = KVLoadRange(covered, endpoint)
+            covered = endpoint
+            if load_async:
+                async_loads.append(i)
+
+        if not ranges:
+            return 0, False
+
+        self._request_load_ranges[req_id] = ranges
+        if async_loads:
+            self._request_async_loads[req_id] = tuple(async_loads)
+        return covered - num_computed_tokens, bool(async_loads)
+
+    def _select_single_load(
+        self, request_id: str, matches: list[tuple[int, bool]]
+    ) -> tuple[int, bool]:
+        """Fall back to the connector with the longest complete prefix."""
+        chosen = max(range(len(matches)), key=lambda i: matches[i][0])
+        toks, load_async = matches[chosen]
+        if toks > 0:
+            self._requests_to_connector[request_id] = chosen
+            if load_async:
+                self._request_async_loads[request_id] = (chosen,)
+        return toks, load_async if toks > 0 else False
 
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
-        chosen_connector = self._requests_to_connector.get(request.request_id, -1)
+        req_id = request.request_id
+        if self._piecewise_load:
+            load_ranges = self._request_load_ranges.pop(req_id, None)
+            async_loads = self._request_async_loads.pop(req_id, None)
+            if num_external_tokens > 0 and async_loads:
+                self._async_loads_to_send[req_id] = async_loads
+            if load_ranges is not None:
+                first_connector = next(iter(load_ranges))
+                for i, c in enumerate(self._connectors):
+                    load_range = load_ranges.get(i)
+                    if load_range is None:
+                        c.update_state_after_alloc(request, blocks, 0)
+                    elif i == first_connector:
+                        c.update_state_after_alloc(
+                            request, blocks, load_range.num_tokens
+                        )
+                    else:
+                        c.update_state_after_alloc_for_range(
+                            request, blocks, load_range
+                        )
+                return
+
+        chosen_connector = self._requests_to_connector.get(req_id, -1)
         for i, c in enumerate(self._connectors):
             if i == chosen_connector:
                 # Forward call to the chosen connector (if any).
@@ -432,6 +542,9 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         if self._extra_async_saves:
             metadata.extra_async_saves = self._extra_async_saves
             self._extra_async_saves = {}
+        if self._piecewise_load and self._async_loads_to_send:
+            metadata.pending_async_loads = self._async_loads_to_send
+            self._async_loads_to_send = {}
         return metadata
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
@@ -510,6 +623,10 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
             self._extra_async_saves[request.request_id] = async_saves - 1
 
         self._requests_to_connector.pop(request.request_id, None)
+        if self._piecewise_load:
+            self._request_load_ranges.pop(request.request_id, None)
+            self._request_async_loads.pop(request.request_id, None)
+            self._async_loads_to_send.pop(request.request_id, None)
 
         return async_saves > 0, kv_txfer_params
 

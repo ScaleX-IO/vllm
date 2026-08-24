@@ -28,6 +28,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    KVLoadRange,
     SupportsHMA,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
@@ -509,6 +510,24 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
             request, blocks, num_external_tokens
         )
 
+    @property
+    def supports_piecewise_load(self) -> bool:
+        return bool(
+            self.connector_scheduler
+            and self.connector_scheduler.supports_piecewise_load
+        )
+
+    def update_state_after_alloc_for_range(
+        self,
+        request: "Request",
+        blocks: "KVCacheBlocks",
+        load_range: KVLoadRange,
+    ) -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.update_state_after_alloc_for_range(
+            request, blocks, load_range
+        )
+
     def build_connector_meta(
         self,
         scheduler_output: SchedulerOutput,
@@ -619,6 +638,12 @@ class MooncakeConnectorScheduler:
         # GDN is represented as a MambaSpec in vLLM. This Mooncake MambaSpec
         # path is currently tested with GDN; Mamba2 is not validated yet.
         self._has_mamba = kv_cache_config.has_mamba_layers
+        self.supports_piecewise_load = len(
+            kv_cache_config.kv_cache_groups
+        ) == 1 and isinstance(
+            kv_cache_config.kv_cache_groups[0].kv_cache_spec,
+            FullAttentionSpec,
+        )
 
         # Requests that need to start recv/send.
         # New requests are added by update_state_after_alloc in
@@ -780,6 +805,36 @@ class MooncakeConnectorScheduler:
             else:
                 # Add an empty list to worker to create event.
                 self._reqs_need_send[request.request_id] = (request, [])
+
+    def update_state_after_alloc_for_range(
+        self,
+        request: "Request",
+        blocks: "KVCacheBlocks",
+        load_range: KVLoadRange,
+    ) -> None:
+        """Receive only the destination blocks covered by a suffix range."""
+        assert self.supports_piecewise_load
+        assert load_range.start_token % self.block_size == 0
+        assert load_range.end_token % self.block_size == 0
+        logger.debug(
+            "MooncakeConnector piecewise load: req_id=%s range=[%d, %d)",
+            request.request_id,
+            load_range.start_token,
+            load_range.end_token,
+        )
+
+        params = request.kv_transfer_params
+        assert params and params.get("do_remote_prefill")
+        assert not self.is_kv_producer
+        assert all(
+            p in params
+            for p in ("remote_engine_id", "remote_bootstrap_addr", "transfer_id")
+        )
+        num_blocks = load_range.num_tokens // self.block_size
+        unhashed_block_ids = blocks.get_unhashed_block_ids_all_groups()
+        local_block_ids = [group[-num_blocks:] for group in unhashed_block_ids]
+        self._reqs_need_recv[request.request_id] = (request, local_block_ids)
+        params["do_remote_prefill"] = False
 
     def build_connector_meta(
         self,

@@ -4,6 +4,7 @@ import filecmp
 import shutil
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -17,6 +18,7 @@ from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
+    KVLoadRange,
     SupportsHMA,
     supports_hma,
 )
@@ -175,6 +177,130 @@ def mc() -> MultiConnector:
     )
 
     return mc
+
+
+def _make_policy_connector(
+    matches: list[tuple[int | None, bool]],
+    supports_piecewise: list[bool],
+) -> MultiConnector:
+    connector = MultiConnector.__new__(MultiConnector)
+    connector._connectors = []
+    for match, supports in zip(matches, supports_piecewise):
+        child = MagicMock(spec_set=KVConnectorBase_V1)
+        child.get_num_new_matched_tokens.return_value = match
+        child.supports_piecewise_load = supports
+        connector._connectors.append(child)
+    connector._piecewise_load = True
+    connector._block_size = 16
+    connector._requests_to_connector = {}
+    connector._request_load_ranges = {}
+    connector._request_async_loads = {}
+    connector._async_loads_to_send = {}
+    connector._pending_async_loads = {}
+    connector._extra_async_saves = {}
+    return connector
+
+
+def test_piecewise_prefix_assigns_store_prefix_and_direct_suffix():
+    connector = _make_policy_connector([(64, True), (96, True)], [False, True])
+    request = SimpleNamespace(request_id="req")
+
+    assert connector.get_num_new_matched_tokens(request, 0) == (96, True)
+    connector.update_state_after_alloc(request, blocks := MagicMock(), 96)
+
+    store, direct = connector._connectors
+    store.update_state_after_alloc.assert_called_once_with(request, blocks, 64)
+    direct.update_state_after_alloc_for_range.assert_called_once_with(
+        request, blocks, KVLoadRange(64, 96)
+    )
+    assert connector._async_loads_to_send == {"req": (0, 1)}
+
+
+def test_piecewise_prefix_extends_a_local_hit():
+    connector = _make_policy_connector([(32, True), (64, True)], [False, True])
+    request = SimpleNamespace(request_id="req")
+
+    assert connector.get_num_new_matched_tokens(request, 32) == (64, True)
+    connector.update_state_after_alloc(request, blocks := MagicMock(), 64)
+
+    store, direct = connector._connectors
+    store.update_state_after_alloc.assert_called_once_with(request, blocks, 32)
+    direct.update_state_after_alloc_for_range.assert_called_once_with(
+        request, blocks, KVLoadRange(64, 96)
+    )
+
+
+def test_piecewise_prefix_falls_back_to_longest_unaligned_hit():
+    connector = _make_policy_connector([(60, True), (96, True)], [False, True])
+    request = SimpleNamespace(request_id="req")
+
+    assert connector.get_num_new_matched_tokens(request, 0) == (96, True)
+    connector.update_state_after_alloc(request, blocks := MagicMock(), 96)
+
+    store, direct = connector._connectors
+    store.update_state_after_alloc.assert_called_once_with(request, blocks, 0)
+    direct.update_state_after_alloc.assert_called_once_with(request, blocks, 96)
+
+
+def test_piecewise_prefix_falls_back_after_two_sources():
+    connector = _make_policy_connector(
+        [(64, True), (96, True), (128, True)], [False, True, True]
+    )
+    request = SimpleNamespace(request_id="req")
+
+    assert connector.get_num_new_matched_tokens(request, 0) == (128, True)
+    connector.update_state_after_alloc(request, blocks := MagicMock(), 128)
+
+    first, second, third = connector._connectors
+    first.update_state_after_alloc.assert_called_once_with(request, blocks, 0)
+    second.update_state_after_alloc.assert_called_once_with(request, blocks, 0)
+    third.update_state_after_alloc.assert_called_once_with(request, blocks, 128)
+    for child in connector._connectors:
+        child.update_state_after_alloc_for_range.assert_not_called()
+
+
+def test_piecewise_prefix_full_store_hit_keeps_direct_notification_empty():
+    connector = _make_policy_connector([(96, True), (96, True)], [False, True])
+    request = SimpleNamespace(request_id="req")
+
+    assert connector.get_num_new_matched_tokens(request, 0) == (96, True)
+    connector.update_state_after_alloc(request, blocks := MagicMock(), 96)
+
+    store, direct = connector._connectors
+    store.update_state_after_alloc.assert_called_once_with(request, blocks, 96)
+    direct.update_state_after_alloc.assert_called_once_with(request, blocks, 0)
+    assert connector._async_loads_to_send == {"req": (0,)}
+
+
+def test_piecewise_prefix_waits_for_all_async_loaders():
+    connector = _make_policy_connector([(64, True), (96, True)], [False, True])
+    connector._pending_async_loads = {"req": {0, 1}}
+    store, direct = connector._connectors
+    store.get_finished.return_value = (None, {"req"})
+    direct.get_finished.return_value = (None, None)
+
+    assert connector.get_finished(set()) == (None, None)
+
+    store.get_finished.return_value = (None, None)
+    direct.get_finished.return_value = (None, {"req"})
+    assert connector.get_finished(set()) == (None, {"req"})
+
+
+def test_default_load_policy_still_selects_first_hit():
+    connector = _make_policy_connector([(64, True), (96, True)], [False, True])
+    connector._piecewise_load = False
+    load_ranges = connector._request_load_ranges = MagicMock()
+    async_loads = connector._request_async_loads = MagicMock()
+    request = SimpleNamespace(request_id="req")
+
+    assert connector.get_num_new_matched_tokens(request, 0) == (64, True)
+    connector.update_state_after_alloc(request, blocks := MagicMock(), 64)
+
+    first, second = connector._connectors
+    first.update_state_after_alloc.assert_called_once_with(request, blocks, 64)
+    second.update_state_after_alloc.assert_called_once_with(request, blocks, 0)
+    load_ranges.pop.assert_not_called()
+    async_loads.pop.assert_not_called()
 
 
 # Helper function to compare directories recursively
@@ -864,6 +990,8 @@ def test_multi_connector_overrides_all_base_methods():
         "role",
         "has_connector_metadata",
         "get_kv_connector_kv_cache_events",
+        "supports_piecewise_load",
+        "update_state_after_alloc_for_range",
     }
 
     base_members = {

@@ -14,10 +14,12 @@ import zmq.asyncio
 from tests.v1.attention.utils import dense_kv_cache_views
 from vllm import envs
 from vllm.config import set_current_vllm_config
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVLoadRange
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import (
     KVConnectorRole,
     MooncakeConnector,
     MooncakeConnectorMetadata,
+    MooncakeConnectorScheduler,
     MooncakeConnectorWorker,
     MooncakeXferMetadata,
     MooncakeXferResponse,
@@ -65,6 +67,51 @@ def _make_test_kv_cache_config() -> KVCacheConfig:
             )
         ],
     )
+
+
+def test_piecewise_load_uses_only_suffix_destination_blocks():
+    scheduler = MooncakeConnectorScheduler.__new__(MooncakeConnectorScheduler)
+    scheduler.supports_piecewise_load = True
+    scheduler.block_size = 16
+    scheduler.is_kv_producer = False
+    scheduler._reqs_need_recv = {}
+    params = {
+        "do_remote_prefill": True,
+        "remote_engine_id": "prefill",
+        "remote_bootstrap_addr": "127.0.0.1:1234",
+        "transfer_id": "transfer",
+    }
+    request = SimpleNamespace(request_id="req", kv_transfer_params=params)
+    blocks = MagicMock()
+    blocks.get_unhashed_block_ids_all_groups.return_value = [[10, 11, 12, 13, 14, 15]]
+
+    scheduler.update_state_after_alloc_for_range(request, blocks, KVLoadRange(64, 96))
+
+    assert scheduler._reqs_need_recv["req"] == (request, [[14, 15]])
+    assert params["do_remote_prefill"] is False
+
+
+def test_piecewise_load_rejects_incomplete_transfer_params():
+    scheduler = MooncakeConnectorScheduler.__new__(MooncakeConnectorScheduler)
+    scheduler.supports_piecewise_load = True
+    scheduler.block_size = 16
+    scheduler.is_kv_producer = False
+    scheduler._reqs_need_recv = {}
+    request = SimpleNamespace(
+        request_id="req",
+        kv_transfer_params={
+            "do_remote_prefill": True,
+            "remote_engine_id": "prefill",
+            "remote_bootstrap_addr": "127.0.0.1:1234",
+        },
+    )
+
+    with pytest.raises(AssertionError):
+        scheduler.update_state_after_alloc_for_range(
+            request, MagicMock(), KVLoadRange(64, 96)
+        )
+
+    assert scheduler._reqs_need_recv == {}
 
 
 class FakeMooncakeWrapper:

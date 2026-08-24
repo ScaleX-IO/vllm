@@ -136,6 +136,43 @@ vllm serve meta-llama/Llama-3.1-8B-Instruct \
     }'
 ```
 
+#### Piecewise Store and P/D prefix loading
+
+By default, `MultiConnector` loads from the first connector with a cache hit.
+To let the decoder load a cached prefix directly from Mooncake Store while
+receiving only the remaining prompt KV from the prefiller, enable the
+`piecewise_prefix` load policy and put `MooncakeStoreConnector` before
+`MooncakeConnector` on both engines:
+
+```json
+{
+    "kv_connector": "MultiConnector",
+    "kv_connector_extra_config": {
+        "load_policy": "piecewise_prefix",
+        "connectors": [
+            {
+                "kv_connector": "MooncakeStoreConnector",
+                "kv_role": "kv_consumer",
+                "kv_connector_extra_config": {
+                    "save_decode_cache": true
+                }
+            },
+            {
+                "kv_connector": "MooncakeConnector",
+                "kv_role": "kv_consumer"
+            }
+        ]
+    }
+}
+```
+
+For example, if Store covers tokens `[0, 1024)` and the prefiller covers
+`[0, 1056)`, the decoder loads `[0, 1024)` from Store and receives only
+`[1024, 1056)` from the prefiller. The initial implementation requires one
+Full Attention KV cache group, a block-aligned split, and at most two
+connectors that contribute KV ranges. Unsupported configurations use the
+single connector with the longest available prefix.
+
 To also offload newly completed decode KV blocks, add the following extra
 configuration to the decoder's `MooncakeStoreConnector` entry.
 
