@@ -34,13 +34,33 @@ async def completion(client: httpx.AsyncClient, url: str, body: dict) -> dict:
     return response.json()
 
 
-async def wait_for_store(client: httpx.AsyncClient, url: str, timeout: float) -> None:
+async def save_put_count(client: httpx.AsyncClient, url: str) -> float:
+    response = await client.get(f"{url}/metrics")
+    response.raise_for_status()
+    return sum(
+        float(line.rsplit(" ", 1)[-1])
+        for line in response.text.splitlines()
+        if line.startswith("vllm:mooncake_store_operation_total{")
+        and 'operation="save_put"' in line
+        and 'status="ok"' in line
+    )
+
+
+async def wait_for_store(
+    client: httpx.AsyncClient,
+    url: str,
+    initial_save_puts: float,
+    timeout: float,
+) -> None:
     deadline = time.monotonic() + timeout
+    saw_put = False
     while True:
-        response = await client.post(f"{url}/reset_prefix_cache")
-        response.raise_for_status()
-        if response.json().get("success"):
-            return
+        saw_put = saw_put or await save_put_count(client, url) > initial_save_puts
+        if saw_put:
+            response = await client.post(f"{url}/reset_prefix_cache")
+            response.raise_for_status()
+            if response.json().get("success"):
+                return
         if time.monotonic() >= deadline:
             raise TimeoutError(f"timed out waiting for Store jobs at {url}")
         await asyncio.sleep(0.25)
@@ -97,9 +117,13 @@ async def verify_loop(args: argparse.Namespace) -> None:
     prompt_ids = reference["prompt_ids"]
     reference_ids = reference["output_ids"]
     async with httpx.AsyncClient(timeout=args.request_timeout) as client:
+        producer_puts = await save_put_count(client, args.producer_url)
         await completion(client, args.producer_url, payload(args.model, prompt_ids, 1))
-        await wait_for_store(client, args.producer_url, args.visibility_timeout)
+        await wait_for_store(
+            client, args.producer_url, producer_puts, args.visibility_timeout
+        )
 
+        consumer_puts = await save_put_count(client, args.consumer_url)
         decoded = await completion(
             client,
             args.consumer_url,
@@ -107,7 +131,15 @@ async def verify_loop(args: argparse.Namespace) -> None:
         )
         decode_ids = decoded["choices"][0]["token_ids"]
         decode_hit = cached_tokens(decoded)
-        if decode_hit <= 0:
+        if (
+            args.expected_decode_cached_tokens is not None
+            and decode_hit != args.expected_decode_cached_tokens
+        ):
+            raise AssertionError(
+                f"unexpected initial hit: {decode_hit} != "
+                f"{args.expected_decode_cached_tokens}"
+            )
+        if args.expected_decode_cached_tokens is None and decode_hit <= 0:
             raise AssertionError("prompt did not hit Mooncake Store")
         compared_ids = decode_ids[: len(reference_ids)]
         if compared_ids != reference_ids:
@@ -124,13 +156,23 @@ async def verify_loop(args: argparse.Namespace) -> None:
                 f"{reference_ids[mismatch]}; cached_tokens={decode_hit}"
             )
 
-        await wait_for_store(client, args.consumer_url, args.visibility_timeout)
+        await wait_for_store(
+            client, args.consumer_url, consumer_puts, args.visibility_timeout
+        )
         extended_ids = prompt_ids + decode_ids
         verified = await completion(
             client, args.producer_url, payload(args.model, extended_ids, 1)
         )
         extended_hit = cached_tokens(verified)
-        if extended_hit <= decode_hit:
+        if (
+            args.expected_extended_cached_tokens is not None
+            and extended_hit != args.expected_extended_cached_tokens
+        ):
+            raise AssertionError(
+                f"unexpected extended hit: {extended_hit} != "
+                f"{args.expected_extended_cached_tokens}"
+            )
+        if args.expected_extended_cached_tokens is None and extended_hit <= decode_hit:
             raise AssertionError(
                 "decode writeback was not reusable by the producer: "
                 f"{extended_hit} <= {decode_hit}"
@@ -160,8 +202,8 @@ def parse_args() -> argparse.Namespace:
         subparser.add_argument("--tokenizer", required=True)
         subparser.add_argument("--reference-json", required=True)
         subparser.add_argument("--output-tokens", type=int, default=64)
-        subparser.add_argument("--prompt-repetitions", type=int, default=128)
-        subparser.add_argument("--prompt-tokens", type=int, default=785)
+        subparser.add_argument("--prompt-repetitions", type=int, default=256)
+        subparser.add_argument("--prompt-tokens", type=int, default=1601)
         subparser.add_argument("--request-timeout", type=float, default=600)
     reference = subparsers.choices["reference"]
     reference.add_argument("--reference-url", required=True)
@@ -169,6 +211,8 @@ def parse_args() -> argparse.Namespace:
     loop.add_argument("--producer-url", required=True)
     loop.add_argument("--consumer-url", required=True)
     loop.add_argument("--visibility-timeout", type=float, default=300)
+    loop.add_argument("--expected-decode-cached-tokens", type=int)
+    loop.add_argument("--expected-extended-cached-tokens", type=int)
     return parser.parse_args()
 
 

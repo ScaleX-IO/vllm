@@ -10,12 +10,17 @@ and write its decode KV and recurrent state back. After its asynchronous Store
 jobs finish, the producer must hit beyond the original prompt when given the
 extended token sequence.
 
-The default workload uses a 785-token prompt and generates 800 tokens. With
-the tested hybrid model's `align` cache mode, the first reusable checkpoint is
-at token 784. Decode crosses the next checkpoint at token 1568, so the final
+The default workload uses a 1601-token prompt and generates 816 tokens. With
+the tested hybrid model's `align` cache mode, the initial reusable checkpoint is
+at token 1600. Decode crosses the next checkpoint at token 2400, so the final
 lookup proves that both the Full Attention KV block and the aligned GDN state
 were written back. `PROMPT_TOKENS` and `OUTPUT_TOKENS` may be adjusted for a
 model with a different aligned checkpoint interval.
+
+All Store endpoints use `--prefix-match-unit 16` by default. Heterogeneous TP
+endpoints must use the same value, and it must divide the normalized Attention
+Store chunk size. Otherwise the connector intentionally falls back to an
+isolated rank-local namespace.
 
 The first 64 generated token IDs are compared with a connector-free reference
 at the consumer TP size. The longer generation is used to cross a checkpoint,
@@ -34,7 +39,19 @@ It requires these variables:
 
 Optional variables include `TP4_GPUS`, `TP2_GPUS`, `HOST_IP`, `PORT_BASE`,
 `RESULT_ROOT`, `STORE_SIZE`, `GPU_MEMORY_UTILIZATION`, `OUTPUT_TOKENS`,
-`REFERENCE_OUTPUT_TOKENS`, `PROMPT_TOKENS`, and `PROMPT_REPETITIONS`.
+`REFERENCE_OUTPUT_TOKENS`, `PROMPT_TOKENS`, `PROMPT_REPETITIONS`,
+`PREFIX_MATCH_UNIT`, `STORE_TP_SIZE`, `EXPECTED_DECODE_CACHED_TOKENS`, and
+`EXPECTED_EXTENDED_CACHED_TOKENS`.
+
+The result directory records the exact feature revision and test configuration
+in `test-config.txt`, per-direction JSON results, service logs, and RDMA
+transfer evidence.
+
+`run_hybrid_attention_early_store.sh` is a focused workload for already-running
+reference, producer, and consumer endpoints. Its default 401-token Decode stops
+before the next complete Mamba/GDN checkpoint: Attention KV is written early,
+but the externally reusable prefix correctly remains at 1600 tokens. The main
+matrix runner crosses the next checkpoint and verifies full Decode writeback.
 
 ```bash
 FEATURE_ROOT=/path/to/vllm-feature \

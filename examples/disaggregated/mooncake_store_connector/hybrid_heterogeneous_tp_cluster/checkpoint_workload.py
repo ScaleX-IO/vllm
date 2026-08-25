@@ -53,15 +53,17 @@ async def wait_for_store(
     timeout: float,
 ) -> None:
     deadline = time.monotonic() + timeout
-    while await save_put_count(client, url) <= initial_save_puts:
+    saw_put = False
+    while True:
+        saw_put = saw_put or await save_put_count(client, url) > initial_save_puts
+        if saw_put:
+            response = await client.post(f"{url}/reset_prefix_cache")
+            response.raise_for_status()
+            if response.json().get("success"):
+                return
         if time.monotonic() >= deadline:
             raise TimeoutError(f"timed out waiting for Store jobs at {url}")
         await asyncio.sleep(0.25)
-
-    response = await client.post(f"{url}/reset_prefix_cache")
-    response.raise_for_status()
-    if not response.json().get("success"):
-        raise RuntimeError(f"failed to reset prefix cache at {url}")
 
 
 def make_prompt_ids(

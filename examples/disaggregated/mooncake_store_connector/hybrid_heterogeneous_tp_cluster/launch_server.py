@@ -20,6 +20,7 @@ def main() -> None:
     parser.add_argument("--cache-prefix", default="")
     parser.add_argument("--lookup-rpc-port", type=int)
     parser.add_argument("--block-size", type=int, default=16)
+    parser.add_argument("--prefix-match-unit", type=int, default=16)
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
     parser.add_argument("--save-decode-cache", action="store_true")
@@ -44,6 +45,8 @@ def main() -> None:
         str(args.tensor_parallel_size),
         "--block-size",
         str(args.block_size),
+        "--prefix-match-unit",
+        str(args.prefix_match_unit),
         "--max-model-len",
         str(args.max_model_len),
         "--gpu-memory-utilization",
