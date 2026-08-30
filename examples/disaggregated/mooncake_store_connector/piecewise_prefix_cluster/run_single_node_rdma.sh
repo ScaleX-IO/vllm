@@ -19,8 +19,9 @@ served=${SERVED_MODEL_NAME:-pd-store-piecewise-probe}
 rdma_device=${RDMA_DEVICE:-mlx5_bond_0}
 mooncake_master_bin=${MOONCAKE_MASTER_BIN:-mooncake_master}
 mooncake_client_bin=${MOONCAKE_CLIENT_BIN:-mooncake_client}
-prefill_gpu=${PREFILL_GPU:-0}
-decode_gpu=${DECODE_GPU:-1}
+store_gpu=${STORE_GPU:-0}
+prefill_gpu=${PREFILL_GPU:-1}
+decode_gpu=${DECODE_GPU:-2}
 run_id=${RUN_ID:-$(date +%Y%m%d-%H%M%S)-$$}
 run_root=${RESULT_ROOT:-/tmp/pd-store-piecewise-$run_id}
 proxy_script=$feature/examples/disaggregated/mooncake_connector/mooncake_connector_proxy.py
@@ -257,12 +258,12 @@ PY
   cd "$feature"
   CUDA_VISIBLE_DEVICES=$prefill_gpu "$python_bin" \
     -W ignore::DeprecationWarning -m pytest -q \
-    tests/v1/kv_connector/unit/test_multi_connector.py::test_piecewise_prefix_assigns_store_prefix_and_direct_suffix \
-    tests/v1/kv_connector/unit/test_multi_connector.py::test_piecewise_prefix_extends_a_local_hit \
-    tests/v1/kv_connector/unit/test_multi_connector.py::test_piecewise_prefix_falls_back_to_longest_unaligned_hit \
-    tests/v1/kv_connector/unit/test_multi_connector.py::test_piecewise_prefix_falls_back_after_two_sources \
-    tests/v1/kv_connector/unit/test_multi_connector.py::test_piecewise_prefix_full_store_hit_keeps_direct_notification_empty \
-    tests/v1/kv_connector/unit/test_multi_connector.py::test_piecewise_prefix_waits_for_all_async_loaders \
+    tests/v1/kv_connector/unit/test_multi_connector.py::test_range_aware_load_assigns_contiguous_ranges \
+    tests/v1/kv_connector/unit/test_multi_connector.py::test_range_aware_load_extends_a_local_hit \
+    tests/v1/kv_connector/unit/test_multi_connector.py::test_range_aware_load_falls_back_to_longest_unaligned_hit \
+    tests/v1/kv_connector/unit/test_multi_connector.py::test_range_aware_load_combines_three_sources \
+    tests/v1/kv_connector/unit/test_multi_connector.py::test_range_aware_load_uses_one_source_for_equal_hits \
+    tests/v1/kv_connector/unit/test_multi_connector.py::test_range_aware_load_waits_for_all_async_sources \
     tests/v1/kv_connector/unit/test_multi_connector.py::test_default_load_policy_still_selects_first_hit \
     tests/v1/kv_connector/unit/test_mooncake_connector.py::test_piecewise_load_uses_only_suffix_destination_blocks \
     tests/v1/kv_connector/unit/test_mooncake_connector.py::test_piecewise_load_rejects_incomplete_transfer_params
@@ -273,7 +274,8 @@ start_store "$run_root/master.log" "$mooncake_master_bin" \
   --http_metadata_server_port="$metadata_port" \
   --enable_metric_reporting=false --metrics_port="$metrics_port"
 sleep 2
-start_store "$run_root/store.log" "$mooncake_client_bin" \
+start_store "$run_root/store.log" env CUDA_VISIBLE_DEVICES="$store_gpu" \
+  "$mooncake_client_bin" \
   --host="$host_ip" --port="$store_port" \
   --master_server_address="$host_ip:$master_port" \
   --metadata_server="http://$host_ip:$metadata_port/metadata" \
@@ -311,12 +313,12 @@ PY
 
 grep -q 'kvpool hit tokens: 1024, need to load: 1024' \
   "$run_root/replay/decode.log"
-grep -q 'piecewise load:.*range=\[1024, 1056)' \
+grep -q 'range load:.*range=\[1024, 1056)' \
   "$run_root/replay/decode.log"
 grep -q 'Sending kv_caches.*(2 blocks)' "$run_root/replay/prefill.log"
 grep -q 'Sending kv_caches.*(66 blocks)' "$run_root/reference/prefill.log"
 
-grep -E -e 'kvpool hit tokens' -e 'piecewise load' \
+grep -E -e 'kvpool hit tokens' -e 'range load' \
   -e 'Sending kv_caches' "$run_root"/replay/*.log \
   >"$run_root/evidence.log"
 

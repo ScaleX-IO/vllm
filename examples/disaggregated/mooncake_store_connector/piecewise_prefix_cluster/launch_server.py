@@ -38,7 +38,7 @@ def main() -> None:
         "kv_connector": "MultiConnector",
         "kv_role": role,
         "kv_connector_extra_config": {
-            "load_policy": "piecewise_prefix",
+            "load_policy": "range_aware",
             "connectors": [
                 {
                     "kv_connector": "MooncakeStoreConnector",
