@@ -43,6 +43,7 @@ The class provides the following primitives:
 import enum
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 import torch
@@ -78,6 +79,21 @@ CopyBlocksOp = Callable[
     ],
     None,
 ]
+
+
+@dataclass(frozen=True)
+class KVLoadRange:
+    """Half-open token range assigned to one connector during a KV load."""
+
+    start_token: int
+    end_token: int
+    # The terminal range owns any recurrent state at end_token.
+    is_terminal: bool = True
+
+    @property
+    def num_tokens(self) -> int:
+        return self.end_token - self.start_token
+
 
 logger = init_logger(__name__)
 
@@ -506,6 +522,25 @@ class KVConnectorBase_V1(ABC):
                 external KV cache. 0 means nothing should be loaded.
         """
         pass
+
+    @property
+    def supports_load_range(self) -> bool:
+        """Whether this connector accepts an explicitly assigned load range."""
+        return False
+
+    @property
+    def load_range_alignment(self) -> int | None:
+        """Required alignment for non-leading ranges; None uses scheduler alignment."""
+        return None
+
+    def update_state_after_alloc_for_range(
+        self,
+        request: "Request",
+        blocks: "KVCacheBlocks",
+        load_range: KVLoadRange,
+    ) -> None:
+        """Load the assigned token range into the request's allocated blocks."""
+        raise NotImplementedError
 
     @abstractmethod
     def build_connector_meta(
