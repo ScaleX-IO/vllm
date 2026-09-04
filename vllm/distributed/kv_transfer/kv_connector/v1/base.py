@@ -83,7 +83,12 @@ CopyBlocksOp = Callable[
 
 @dataclass(frozen=True)
 class KVLoadRange:
-    """Half-open token range assigned to one connector during a KV load."""
+    """Half-open absolute token range assigned to one connector.
+
+    A boundary shared by two sources is aligned for both connectors and the
+    scheduler's KV block layout. Only a terminal range may end in a partial
+    scheduler block.
+    """
 
     start_token: int
     end_token: int
@@ -525,12 +530,20 @@ class KVConnectorBase_V1(ABC):
 
     @property
     def supports_load_range(self) -> bool:
-        """Whether this connector accepts an explicitly assigned load range."""
+        """Whether this connector accepts an explicitly assigned load range.
+
+        MultiConnector only composes children whose lookup results agree on
+        synchronous versus asynchronous loading; otherwise it uses one child.
+        """
         return False
 
     @property
     def load_range_alignment(self) -> int | None:
-        """Additional positive alignment for inter-source range boundaries."""
+        """Additional positive alignment for inter-source boundaries.
+
+        MultiConnector combines this value with the scheduler block size and
+        the neighboring connector's requirement. ``None`` adds no constraint.
+        """
         return None
 
     def update_state_after_alloc_for_range(
@@ -539,7 +552,15 @@ class KVConnectorBase_V1(ABC):
         blocks: "KVCacheBlocks",
         load_range: KVLoadRange,
     ) -> None:
-        """Load the assigned token range into the request's allocated blocks."""
+        """Load an absolute token range into the request's allocated blocks.
+
+        ``blocks`` is the request's complete allocated block table, not a view
+        sliced to ``load_range``. Implementations must locate each KV group's
+        destination blocks from the absolute token offsets. A later
+        ``update_state_after_alloc(request, blocks, 0)`` is allowed and must
+        remain a no-load operation. Load failures follow the
+        ``get_block_ids_with_load_errors`` contract.
+        """
         raise NotImplementedError
 
     @abstractmethod

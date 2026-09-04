@@ -192,6 +192,14 @@ def test_register_finished_partial_tail_notifies_every_connector():
     )
 
 
+def test_multi_connector_aggregates_load_errors(mc: MultiConnector):
+    first, second = mc._connectors
+    first.get_block_ids_with_load_errors.return_value = {1, 2}
+    second.get_block_ids_with_load_errors.return_value = {2, 3}
+
+    assert mc.get_block_ids_with_load_errors() == {1, 2, 3}
+
+
 @pytest.fixture
 def mc() -> MultiConnector:
     """MultiConnector using two mocked connectors"""
@@ -512,6 +520,20 @@ def test_range_aware_load_combines_adjacent_and_scheduler_alignments():
     assert connector._request_load_ranges["req"] == {
         0: KVLoadRange(0, 48, is_terminal=False),
         1: KVLoadRange(48, 96, is_terminal=True),
+    }
+
+
+def test_range_aware_load_skips_unaligned_explicit_leader():
+    connector = _make_policy_connector(
+        [(32, True), (64, True), (96, True)], [True, True, True]
+    )
+    connector._connectors[0].load_range_alignment = 64
+    request = SimpleNamespace(request_id="req")
+
+    assert connector.get_num_new_matched_tokens(request, 16) == (96, True)
+    assert connector._request_load_ranges["req"] == {
+        1: KVLoadRange(16, 80, is_terminal=False),
+        2: KVLoadRange(80, 112, is_terminal=True),
     }
 
 
