@@ -3,6 +3,7 @@
 import copy
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from math import lcm
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -31,7 +32,7 @@ from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.kv_cache_interface import MambaSpec, iter_layer_specs
 from vllm.v1.outputs import KVConnectorOutput
 
 if TYPE_CHECKING:
@@ -201,8 +202,9 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         self._scheduler_block_size = None
         if self._range_load:
             has_recurrent_state = any(
-                isinstance(group.kv_cache_spec, MambaSpec)
+                isinstance(spec, MambaSpec)
                 for group in kv_cache_config.kv_cache_groups
+                for spec in iter_layer_specs(group.kv_cache_spec)
             )
             if (
                 role == KVConnectorRole.SCHEDULER
@@ -453,6 +455,18 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
     # ==============================
     # Scheduler-side methods
     # ==============================
+    def _effective_load_range_alignment(self, connector: KVConnectorBase_V1) -> int:
+        assert self._scheduler_block_size is not None
+        connector_alignment = connector.load_range_alignment
+        if connector_alignment is None:
+            return self._scheduler_block_size
+        if connector_alignment <= 0:
+            raise ValueError(
+                "Connector load_range_alignment must be positive, got "
+                f"{connector_alignment} for {connector.__class__.__name__}"
+            )
+        return lcm(self._scheduler_block_size, connector_alignment)
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",
@@ -497,14 +511,17 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
             if ranges:
                 if not connector.supports_load_range:
                     continue
-                alignment = connector.load_range_alignment
-                if alignment is None:
-                    assert self._scheduler_block_size is not None
-                    alignment = self._scheduler_block_size
+                alignment = self._effective_load_range_alignment(connector)
+                previous_connector = next(reversed(ranges))
+                previous = self._connectors[previous_connector]
+                if previous.supports_load_range:
+                    alignment = lcm(
+                        alignment,
+                        self._effective_load_range_alignment(previous),
+                    )
                 if covered % alignment:
                     aligned_covered = covered // alignment * alignment
-                    previous_connector = next(reversed(ranges))
-                    if not self._connectors[previous_connector].supports_load_range:
+                    if not previous.supports_load_range:
                         return self._select_single_load(req_id, matches)
                     previous_range = ranges[previous_connector]
                     if aligned_covered <= previous_range.start_token:
@@ -515,6 +532,11 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
                         is_terminal=False,
                     )
                     covered = aligned_covered
+            elif (
+                connector.supports_load_range
+                and covered % self._effective_load_range_alignment(connector)
+            ):
+                continue
             ranges[i] = KVLoadRange(covered, endpoint, is_terminal=False)
             covered = endpoint
 

@@ -42,6 +42,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     MambaSpec,
     SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import KVConnectorOutput, KVConnectorWorkerMetadata
 from vllm.v1.request import RequestStatus
@@ -286,18 +287,27 @@ def _make_unequal_group_cache_config() -> KVCacheConfig:
     )
 
 
-def _make_recurrent_cache_config() -> KVCacheConfig:
+def _make_recurrent_cache_config(*, wrapped: bool = False) -> KVCacheConfig:
+    mamba_spec = MambaSpec(
+        block_size=16,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+    )
+    group_spec = (
+        UniformTypeKVCacheSpecs(
+            block_size=16,
+            kv_cache_specs={"mamba": mamba_spec},
+        )
+        if wrapped
+        else mamba_spec
+    )
     return KVCacheConfig(
         num_blocks=0,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
                 ["mamba"],
-                MambaSpec(
-                    block_size=16,
-                    shapes=((1, 1),),
-                    dtypes=(torch.float32,),
-                ),
+                group_spec,
             )
         ],
     )
@@ -322,12 +332,13 @@ def test_multi_connector_rejects_unknown_load_policy():
         )
 
 
-def test_range_aware_recurrent_cache_requires_range_capable_children():
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_range_aware_recurrent_cache_requires_range_capable_children(wrapped: bool):
     with pytest.raises(ValueError, match="requires every child connector"):
         MultiConnector(
             _make_hybrid_policy_config(),
             KVConnectorRole.SCHEDULER,
-            _make_recurrent_cache_config(),
+            _make_recurrent_cache_config(wrapped=wrapped),
         )
 
 
@@ -391,6 +402,7 @@ def test_scheduler_partial_local_tail_cancels_range_load():
     first.get_num_new_matched_tokens.return_value = (0, True)
     second.get_num_new_matched_tokens.return_value = (6, True)
     second.supports_load_range = True
+    second.load_range_alignment = None
 
     request = create_request(num_tokens=32, block_size=16)
     scheduler.add_request(request)
@@ -490,16 +502,26 @@ def test_range_aware_load_falls_back_when_aligned_range_is_empty():
     second.update_state_after_alloc.assert_called_once_with(request, blocks, 96)
 
 
-def test_range_aware_load_uses_connector_alignment():
-    connector = _make_policy_connector([(60, True), (96, True)], [False, True])
+def test_range_aware_load_combines_adjacent_and_scheduler_alignments():
+    connector = _make_policy_connector([(60, True), (96, True)], [True, True])
+    connector._connectors[0].load_range_alignment = 24
     connector._connectors[1].load_range_alignment = 4
     request = SimpleNamespace(request_id="req")
 
     assert connector.get_num_new_matched_tokens(request, 0) == (96, True)
     assert connector._request_load_ranges["req"] == {
-        0: KVLoadRange(0, 60, is_terminal=False),
-        1: KVLoadRange(60, 96, is_terminal=True),
+        0: KVLoadRange(0, 48, is_terminal=False),
+        1: KVLoadRange(48, 96, is_terminal=True),
     }
+
+
+@pytest.mark.parametrize("alignment", [0, -1])
+def test_range_aware_load_rejects_non_positive_alignment(alignment: int):
+    connector = _make_policy_connector([(64, True), (96, True)], [True, True])
+    connector._connectors[1].load_range_alignment = alignment
+
+    with pytest.raises(ValueError, match="load_range_alignment must be positive"):
+        connector.get_num_new_matched_tokens(SimpleNamespace(request_id="req"), 0)
 
 
 def test_range_aware_load_combines_three_sources():

@@ -530,7 +530,7 @@ class KVConnectorBase_V1(ABC):
 
     @property
     def load_range_alignment(self) -> int | None:
-        """Required alignment for non-leading ranges; None uses scheduler alignment."""
+        """Additional positive alignment for inter-source range boundaries."""
         return None
 
     def update_state_after_alloc_for_range(
