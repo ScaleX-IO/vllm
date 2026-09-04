@@ -98,6 +98,16 @@ def test_piecewise_load_uses_only_suffix_destination_blocks():
     assert params["do_remote_prefill"] is False
 
 
+def test_piecewise_load_rejects_non_terminal_range():
+    scheduler = MooncakeConnectorScheduler.__new__(MooncakeConnectorScheduler)
+    scheduler.supports_load_range = True
+
+    with pytest.raises(ValueError, match="only supports a terminal"):
+        scheduler.update_state_after_alloc_for_range(
+            MagicMock(), MagicMock(), KVLoadRange(0, 16, is_terminal=False)
+        )
+
+
 def test_piecewise_load_rejects_incomplete_transfer_params():
     scheduler = MooncakeConnectorScheduler.__new__(MooncakeConnectorScheduler)
     scheduler.supports_load_range = True

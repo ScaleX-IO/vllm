@@ -852,8 +852,12 @@ class MooncakeConnectorScheduler:
         blocks: "KVCacheBlocks",
         load_range: KVLoadRange,
     ) -> None:
-        """Receive only the destination blocks covered by a suffix range."""
+        """Receive destination blocks for the terminal prompt suffix."""
         assert self.supports_load_range
+        if not load_range.is_terminal:
+            raise ValueError(
+                "MooncakeConnector only supports a terminal piecewise load range"
+            )
         if load_range.start_token % self._scheduler_block_size:
             raise ValueError(
                 f"Piecewise range start {load_range.start_token} is not aligned "
