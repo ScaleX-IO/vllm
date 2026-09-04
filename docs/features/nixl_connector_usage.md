@@ -108,6 +108,18 @@ python tests/v1/kv_connector/nixl_integration/toy_proxy_server.py \
   --decoder-ports 8200
 ```
 
+### Piecewise loading with an external KV store
+
+`NixlConnector` and `NixlPushConnector` can be the terminal member of a
+`MultiConnector` range load. Put a range-capable Store connector first and set
+`load_policy` to `range_aware`; the decoder then reads the cached prefix from
+Store and transfers only the remaining prompt KV through NIXL. Use the same
+connector order on prefiller and decoder, and configure Store as read-only if
+the test or deployment must keep its prefix boundary fixed.
+
+The executable pull/push, Store-miss, and Store-full validation is in
+[`piecewise_range`](../../tests/v1/kv_connector/nixl_integration/piecewise_range/README.md).
+
 ## Environment Variables
 
 - `VLLM_NIXL_SIDE_CHANNEL_PORT`: Port for NIXL handshake communication

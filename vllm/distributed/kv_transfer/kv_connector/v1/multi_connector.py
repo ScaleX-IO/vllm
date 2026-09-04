@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
+import json
+import logging
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from math import lcm
@@ -568,6 +570,25 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         self._request_load_ranges[req_id] = ranges
         if async_loads:
             self._request_async_loads[req_id] = async_loads
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "KV_LOAD_PLAN %s",
+                json.dumps(
+                    {
+                        "request_id": req_id,
+                        "entries": [
+                            {
+                                "connector": type(self._connectors[i]).__name__,
+                                "start_token": load_range.start_token,
+                                "end_token": load_range.end_token,
+                                "is_terminal": load_range.is_terminal,
+                            }
+                            for i, load_range in ranges.items()
+                        ],
+                    },
+                    separators=(",", ":"),
+                ),
+            )
         return covered - num_computed_tokens, bool(async_loads)
 
     def _select_single_load(

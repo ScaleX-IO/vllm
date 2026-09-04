@@ -219,7 +219,7 @@ async def stream_service_response(
 async def _handle_completions(api: str, request: Request):
     try:
         req_data = await request.json()
-        request_id = str(uuid.uuid4())
+        request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
 
         # Get the next prefill client in round-robin fashion
         prefill_client_info = get_next_client(request.app, "prefill")

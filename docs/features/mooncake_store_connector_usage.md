@@ -177,6 +177,11 @@ final endpoint may be partial. Piecewise loading supports hybrid attention
 layouts, including packed Full/MLA and sliding-window groups. Requests with
 recurrent-state groups such as Mamba use single-source loading.
 
+`NixlConnector` or `NixlPushConnector` can replace `MooncakeConnector` in this
+configuration. Unlike the direct Mooncake connector, NIXL supports terminal
+range loads for recurrent-state groups. A runnable Store+NIXL matrix is in
+[`piecewise_range`](../../tests/v1/kv_connector/nixl_integration/piecewise_range/README.md).
+
 If ranges cannot be composed at aligned boundaries, MultiConnector falls back
 to the single connector with the longest available prefix.
 
