@@ -197,9 +197,9 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
                         local_num_computed_blocks = tuple(
                             sum(
                                 block.block_hash is not None and not block.is_null
-                                for block in group
+                                for block in blocks.blocks[group_id]
                             )
-                            for group in blocks.blocks
+                            for group_id in self.kv_cache_config.transfer_group_ids
                         )
 
                     # Get unhashed blocks to pull from remote. Mind that a full prefix

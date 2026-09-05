@@ -94,7 +94,16 @@ def test_needs_split_local_xfer_handles(use_mla, source_ranks, tp_ratio, expecte
 
 
 @pytest.mark.cpu_test
-def test_update_state_after_alloc_tracks_cached_blocks_per_group():
+@pytest.mark.parametrize(
+    "transfer_group_ids,expected_num_computed_blocks",
+    [
+        pytest.param((0, 1), (2, 1), id="all_groups"),
+        pytest.param((1,), (1,), id="nonzero_transfer_group"),
+    ],
+)
+def test_update_state_after_alloc_tracks_cached_blocks_per_group(
+    transfer_group_ids, expected_num_computed_blocks
+):
     """Hybrid SWA+FA requests can have different prefix-cache-hit counts per
     KV cache group. Each group's count must be tracked independently rather
     than collapsed to a single scalar, or DCP read-phase alignment
@@ -113,7 +122,10 @@ def test_update_state_after_alloc_tracks_cached_blocks_per_group():
     scheduler.is_bidirectional_kv_xfer_enabled = False
     scheduler._is_hma_required = False
     scheduler.kv_cache_config = MagicMock(
-        select_transfer_block_ids=lambda block_ids: block_ids
+        transfer_group_ids=transfer_group_ids,
+        select_transfer_block_ids=lambda block_ids: tuple(
+            block_ids[group_id] for group_id in transfer_group_ids
+        ),
     )
 
     def cached(block_id):
@@ -135,10 +147,11 @@ def test_update_state_after_alloc_tracks_cached_blocks_per_group():
 
     scheduler.update_state_after_alloc(request, blocks, num_external_tokens=2)
 
-    _, _, local_num_computed_blocks, load_start, load_end = scheduler._reqs_need_recv[
-        request.request_id
-    ]
-    assert local_num_computed_blocks == (2, 1)
+    _, local_block_ids, local_num_computed_blocks, load_start, load_end = (
+        scheduler._reqs_need_recv[request.request_id]
+    )
+    assert len(local_block_ids) == len(local_num_computed_blocks)
+    assert local_num_computed_blocks == expected_num_computed_blocks
     assert (load_start, load_end) == (
         request.num_computed_tokens,
         request.num_computed_tokens + 2,
