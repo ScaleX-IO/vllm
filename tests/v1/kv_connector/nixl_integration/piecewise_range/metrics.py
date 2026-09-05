@@ -69,12 +69,44 @@ def snapshot(url: str, output: Path, settle_attempts: int) -> None:
     output.write_text(current, encoding="utf-8")
 
 
+def wait_for_total(
+    url: str,
+    output: Path,
+    name: str,
+    labels: dict[str, str],
+    minimum: float,
+    attempts: int,
+) -> None:
+    for _ in range(attempts):
+        current = fetch(url)
+        if total(current, name, labels) >= minimum:
+            output.write_text(current, encoding="utf-8")
+            return
+        time.sleep(1)
+    raise RuntimeError(f"{name} did not reach {minimum}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--settle-attempts", type=int, default=1)
+    parser.add_argument("--wait-name")
+    parser.add_argument("--wait-label", action="append", default=[])
+    parser.add_argument("--wait-minimum", type=float, default=1)
+    parser.add_argument("--wait-attempts", type=int, default=60)
     args = parser.parse_args()
+    if args.wait_name:
+        labels = dict(label.split("=", 1) for label in args.wait_label)
+        wait_for_total(
+            args.url,
+            args.output,
+            args.wait_name,
+            labels,
+            args.wait_minimum,
+            args.wait_attempts,
+        )
+        return
     snapshot(args.url, args.output, args.settle_attempts)
 
 

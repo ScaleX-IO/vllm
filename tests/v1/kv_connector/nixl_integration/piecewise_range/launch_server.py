@@ -20,23 +20,28 @@ def _store_config(args: argparse.Namespace, role: str) -> dict:
     }
 
 
-def _piecewise_config(args: argparse.Namespace) -> dict:
+def _pd_config(args: argparse.Namespace) -> dict:
     role = "kv_producer" if args.role == "prefill" else "kv_consumer"
     nixl = "NixlConnector" if args.mode == "pull" else "NixlPushConnector"
+    store = _store_config(args, "kv_consumer")
+    if args.scenario == "legacy" and args.role == "decode":
+        store["kv_connector_extra_config"]["enable_lookup"] = False
+    extra = {
+        "connectors": [
+            store,
+            {
+                "kv_connector": nixl,
+                "kv_role": role,
+                "kv_load_failure_policy": "fail",
+            },
+        ],
+    }
+    if args.scenario == "piecewise":
+        extra["load_policy"] = "range_aware"
     return {
         "kv_connector": "MultiConnector",
         "kv_role": role,
-        "kv_connector_extra_config": {
-            "load_policy": "range_aware",
-            "connectors": [
-                _store_config(args, "kv_consumer"),
-                {
-                    "kv_connector": nixl,
-                    "kv_role": role,
-                    "kv_load_failure_policy": "fail",
-                },
-            ],
-        },
+        "kv_connector_extra_config": extra,
     }
 
 
@@ -46,6 +51,9 @@ def parse_args() -> argparse.Namespace:
         "--role", choices=("reference", "seeder", "prefill", "decode"), required=True
     )
     parser.add_argument("--mode", choices=("pull", "push"), default="pull")
+    parser.add_argument(
+        "--scenario", choices=("piecewise", "legacy"), default="piecewise"
+    )
     parser.add_argument("--model", required=True)
     parser.add_argument("--served-model-name", required=True)
     parser.add_argument("--port", type=int, required=True)
@@ -87,7 +95,7 @@ def main() -> None:
             ("--kv-transfer-config", json.dumps(_store_config(args, "kv_producer")))
         )
     elif args.role in ("prefill", "decode"):
-        command.extend(("--kv-transfer-config", json.dumps(_piecewise_config(args))))
+        command.extend(("--kv-transfer-config", json.dumps(_pd_config(args))))
     command.extend(shlex.split(os.environ.get("VLLM_SERVE_EXTRA_ARGS", "")))
     os.execvp(command[0], command)
 
