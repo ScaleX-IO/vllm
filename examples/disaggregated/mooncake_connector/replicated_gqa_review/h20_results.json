@@ -1,0 +1,794 @@
+[
+  {
+    "case": "gqa_fan_in",
+    "p_tp": 8,
+    "d_tp": 2,
+    "reader_rank": 0,
+    "transfers": [
+      {
+        "producer_rank": 0,
+        "responses": [
+          {
+            "status": 0,
+            "ok_reqs": [
+              "d-gqa_fan_in-0-0"
+            ]
+          }
+        ],
+        "stats": {
+          "transfer_duration": [
+            0.010606963187456131
+          ],
+          "bytes_transferred": [
+            65536
+          ],
+          "num_descriptors": [
+            1
+          ],
+          "num_failed_transfers": [],
+          "num_failed_recvs": [],
+          "num_kv_expired_reqs": []
+        }
+      },
+      {
+        "producer_rank": 1,
+        "responses": [
+          {
+            "status": 0,
+            "ok_reqs": [
+              "d-gqa_fan_in-1-0"
+            ]
+          }
+        ],
+        "stats": {
+          "transfer_duration": [],
+          "bytes_transferred": [],
+          "num_descriptors": [],
+          "num_failed_transfers": [],
+          "num_failed_recvs": [],
+          "num_kv_expired_reqs": []
+        }
+      },
+      {
+        "producer_rank": 2,
+        "responses": [
+          {
+            "status": 0,
+            "ok_reqs": [
+              "d-gqa_fan_in-2-0"
+            ]
+          }
+        ],
+        "stats": {
+          "transfer_duration": [
+            7.323501631617546e-05
+          ],
+          "bytes_transferred": [
+            65536
+          ],
+          "num_descriptors": [
+            1
+          ],
+          "num_failed_transfers": [],
+          "num_failed_recvs": [],
+          "num_kv_expired_reqs": []
+        }
+      },
+      {
+        "producer_rank": 3,
+        "responses": [
+          {
+            "status": 0,
+            "ok_reqs": [
+              "d-gqa_fan_in-3-0"
+            ]
+          }
+        ],
+        "stats": {
+          "transfer_duration": [],
+          "bytes_transferred": [],
+          "num_descriptors": [],
+          "num_failed_transfers": [],
+          "num_failed_recvs": [],
+          "num_kv_expired_reqs": []
+        }
+      }
+    ],
+    "payload": {
+      "model.layers.0.self_attn": {
+        "bytes": 131072,
+        "mismatched_bytes": 0,
+        "untouched_sentinel_bytes": 0,
+        "guard_block_intact": true,
+        "first_16_bytes": [
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10
+        ]
+      }
+    }
+  },
+  {
+    "case": "gqa_fan_out",
+    "p_tp": 2,
+    "d_tp": 8,
+    "reader_rank": 0,
+    "transfers": [
+      {
+        "producer_rank": 0,
+        "responses": [
+          {
+            "status": 0,
+            "ok_reqs": [
+              "d-gqa_fan_out-0-0"
+            ]
+          }
+        ],
+        "stats": {
+          "transfer_duration": [
+            0.0006175823509693146
+          ],
+          "bytes_transferred": [
+            65536
+          ],
+          "num_descriptors": [
+            1
+          ],
+          "num_failed_transfers": [],
+          "num_failed_recvs": [],
+          "num_kv_expired_reqs": []
+        }
+      }
+    ],
+    "payload": {
+      "model.layers.0.self_attn": {
+        "bytes": 65536,
+        "mismatched_bytes": 0,
+        "untouched_sentinel_bytes": 0,
+        "guard_block_intact": true,
+        "first_16_bytes": [
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10
+        ]
+      }
+    }
+  },
+  {
+    "case": "gqa_fan_out",
+    "p_tp": 2,
+    "d_tp": 8,
+    "reader_rank": 1,
+    "transfers": [
+      {
+        "producer_rank": 0,
+        "responses": [
+          {
+            "status": 0,
+            "ok_reqs": [
+              "d-gqa_fan_out-0-1"
+            ]
+          }
+        ],
+        "stats": {
+          "transfer_duration": [
+            0.0003124149516224861
+          ],
+          "bytes_transferred": [
+            65536
+          ],
+          "num_descriptors": [
+            1
+          ],
+          "num_failed_transfers": [],
+          "num_failed_recvs": [],
+          "num_kv_expired_reqs": []
+        }
+      }
+    ],
+    "payload": {
+      "model.layers.0.self_attn": {
+        "bytes": 65536,
+        "mismatched_bytes": 0,
+        "untouched_sentinel_bytes": 0,
+        "guard_block_intact": true,
+        "first_16_bytes": [
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10
+        ]
+      }
+    }
+  },
+  {
+    "case": "gqa_fan_out",
+    "p_tp": 2,
+    "d_tp": 8,
+    "reader_rank": 2,
+    "transfers": [
+      {
+        "producer_rank": 0,
+        "responses": [
+          {
+            "status": 0,
+            "ok_reqs": [
+              "d-gqa_fan_out-0-2"
+            ]
+          }
+        ],
+        "stats": {
+          "transfer_duration": [
+            0.00027916301041841507
+          ],
+          "bytes_transferred": [
+            65536
+          ],
+          "num_descriptors": [
+            1
+          ],
+          "num_failed_transfers": [],
+          "num_failed_recvs": [],
+          "num_kv_expired_reqs": []
+        }
+      }
+    ],
+    "payload": {
+      "model.layers.0.self_attn": {
+        "bytes": 65536,
+        "mismatched_bytes": 0,
+        "untouched_sentinel_bytes": 0,
+        "guard_block_intact": true,
+        "first_16_bytes": [
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11
+        ]
+      }
+    }
+  },
+  {
+    "case": "gqa_fan_out",
+    "p_tp": 2,
+    "d_tp": 8,
+    "reader_rank": 3,
+    "transfers": [
+      {
+        "producer_rank": 0,
+        "responses": [
+          {
+            "status": 0,
+            "ok_reqs": [
+              "d-gqa_fan_out-0-3"
+            ]
+          }
+        ],
+        "stats": {
+          "transfer_duration": [
+            0.0004859357140958309
+          ],
+          "bytes_transferred": [
+            65536
+          ],
+          "num_descriptors": [
+            1
+          ],
+          "num_failed_transfers": [],
+          "num_failed_recvs": [],
+          "num_kv_expired_reqs": []
+        }
+      }
+    ],
+    "payload": {
+      "model.layers.0.self_attn": {
+        "bytes": 65536,
+        "mismatched_bytes": 0,
+        "untouched_sentinel_bytes": 0,
+        "guard_block_intact": true,
+        "first_16_bytes": [
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11,
+          11
+        ]
+      }
+    }
+  },
+  {
+    "case": "base_hybrid_gdn",
+    "p_tp": 4,
+    "d_tp": 8,
+    "reader_rank": 0,
+    "transfers": [
+      {
+        "producer_rank": 0,
+        "responses": [
+          {
+            "status": 2,
+            "err_msg": "Mooncake source KV region length does not match the consumer TP ratio at region 0: local=65536, remote=65536, tp_ratio=-2."
+          }
+        ],
+        "stats": {
+          "transfer_duration": [],
+          "bytes_transferred": [],
+          "num_descriptors": [],
+          "num_failed_transfers": [],
+          "num_failed_recvs": [],
+          "num_kv_expired_reqs": []
+        }
+      }
+    ],
+    "payload": {
+      "model.layers.0.self_attn": {
+        "bytes": 65536,
+        "mismatched_bytes": 65536,
+        "untouched_sentinel_bytes": 65536,
+        "guard_block_intact": true,
+        "first_16_bytes": [
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253
+        ]
+      },
+      "model.layers.1.linear_attn": {
+        "bytes": 400896,
+        "mismatched_bytes": 400896,
+        "untouched_sentinel_bytes": 400896,
+        "guard_block_intact": true,
+        "first_16_bytes": [
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253
+        ],
+        "conv_mismatched_elements": 3840,
+        "ssm_mismatched_elements": 98304
+      }
+    }
+  },
+  {
+    "case": "base_hybrid_gdn",
+    "p_tp": 4,
+    "d_tp": 8,
+    "reader_rank": 1,
+    "transfers": [
+      {
+        "producer_rank": 0,
+        "responses": [
+          {
+            "status": 2,
+            "err_msg": "Mooncake source KV region length does not match the consumer TP ratio at region 0: local=65536, remote=65536, tp_ratio=-2."
+          }
+        ],
+        "stats": {
+          "transfer_duration": [],
+          "bytes_transferred": [],
+          "num_descriptors": [],
+          "num_failed_transfers": [],
+          "num_failed_recvs": [],
+          "num_kv_expired_reqs": []
+        }
+      }
+    ],
+    "payload": {
+      "model.layers.0.self_attn": {
+        "bytes": 65536,
+        "mismatched_bytes": 65536,
+        "untouched_sentinel_bytes": 65536,
+        "guard_block_intact": true,
+        "first_16_bytes": [
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253
+        ]
+      },
+      "model.layers.1.linear_attn": {
+        "bytes": 400896,
+        "mismatched_bytes": 400896,
+        "untouched_sentinel_bytes": 400896,
+        "guard_block_intact": true,
+        "first_16_bytes": [
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253
+        ],
+        "conv_mismatched_elements": 3840,
+        "ssm_mismatched_elements": 98304
+      }
+    }
+  },
+  {
+    "case": "hybrid_gdn",
+    "p_tp": 4,
+    "d_tp": 8,
+    "reader_rank": 0,
+    "transfers": [
+      {
+        "producer_rank": 0,
+        "responses": [
+          {
+            "status": 0,
+            "ok_reqs": [
+              "d-hybrid_gdn-0-0"
+            ]
+          }
+        ],
+        "stats": {
+          "transfer_duration": [
+            0.0004697609692811966
+          ],
+          "bytes_transferred": [
+            466432
+          ],
+          "num_descriptors": [
+            2
+          ],
+          "num_failed_transfers": [],
+          "num_failed_recvs": [],
+          "num_kv_expired_reqs": []
+        }
+      }
+    ],
+    "payload": {
+      "model.layers.0.self_attn": {
+        "bytes": 65536,
+        "mismatched_bytes": 0,
+        "untouched_sentinel_bytes": 0,
+        "guard_block_intact": true,
+        "first_16_bytes": [
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10
+        ]
+      },
+      "model.layers.1.linear_attn": {
+        "bytes": 400896,
+        "mismatched_bytes": 109769,
+        "untouched_sentinel_bytes": 0,
+        "guard_block_intact": true,
+        "first_16_bytes": [
+          128,
+          63,
+          0,
+          64,
+          64,
+          64,
+          128,
+          64,
+          160,
+          64,
+          192,
+          64,
+          224,
+          64,
+          0,
+          65
+        ],
+        "conv_mismatched_elements": 3072,
+        "ssm_mismatched_elements": 98304
+      }
+    }
+  },
+  {
+    "case": "hybrid_gdn",
+    "p_tp": 4,
+    "d_tp": 8,
+    "reader_rank": 1,
+    "transfers": [
+      {
+        "producer_rank": 0,
+        "responses": [
+          {
+            "status": 0,
+            "ok_reqs": [
+              "d-hybrid_gdn-0-1"
+            ]
+          }
+        ],
+        "stats": {
+          "transfer_duration": [
+            0.0003406316973268986
+          ],
+          "bytes_transferred": [
+            466432
+          ],
+          "num_descriptors": [
+            2
+          ],
+          "num_failed_transfers": [],
+          "num_failed_recvs": [],
+          "num_kv_expired_reqs": []
+        }
+      }
+    ],
+    "payload": {
+      "model.layers.0.self_attn": {
+        "bytes": 65536,
+        "mismatched_bytes": 0,
+        "untouched_sentinel_bytes": 0,
+        "guard_block_intact": true,
+        "first_16_bytes": [
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10
+        ]
+      },
+      "model.layers.1.linear_attn": {
+        "bytes": 400896,
+        "mismatched_bytes": 7241,
+        "untouched_sentinel_bytes": 0,
+        "guard_block_intact": true,
+        "first_16_bytes": [
+          0,
+          0,
+          2,
+          67,
+          0,
+          0,
+          3,
+          67,
+          0,
+          0,
+          4,
+          67,
+          0,
+          0,
+          5,
+          67
+        ],
+        "conv_mismatched_elements": 3840,
+        "ssm_mismatched_elements": 0
+      }
+    }
+  },
+  {
+    "case": "base_mismatched_region",
+    "p_tp": 1,
+    "d_tp": 8,
+    "reader_rank": 0,
+    "transfers": [
+      {
+        "producer_rank": 0,
+        "responses": [
+          {
+            "status": 2,
+            "err_msg": "Mooncake source KV region length does not match the consumer TP ratio at region 0: local=262144, remote=131072, tp_ratio=-8."
+          }
+        ],
+        "stats": {
+          "transfer_duration": [],
+          "bytes_transferred": [],
+          "num_descriptors": [],
+          "num_failed_transfers": [],
+          "num_failed_recvs": [],
+          "num_kv_expired_reqs": []
+        }
+      }
+    ],
+    "payload": {
+      "model.layers.0.self_attn": {
+        "bytes": 131072,
+        "mismatched_bytes": 131072,
+        "untouched_sentinel_bytes": 131072,
+        "guard_block_intact": true,
+        "first_16_bytes": [
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253,
+          253
+        ]
+      }
+    }
+  },
+  {
+    "case": "mismatched_region",
+    "p_tp": 1,
+    "d_tp": 8,
+    "reader_rank": 0,
+    "transfers": [
+      {
+        "producer_rank": 0,
+        "responses": [
+          {
+            "status": 0,
+            "ok_reqs": [
+              "d-mismatched_region-0-0"
+            ]
+          }
+        ],
+        "stats": {
+          "transfer_duration": [
+            0.00029614707455039024
+          ],
+          "bytes_transferred": [
+            65536
+          ],
+          "num_descriptors": [
+            1
+          ],
+          "num_failed_transfers": [],
+          "num_failed_recvs": [],
+          "num_kv_expired_reqs": []
+        }
+      }
+    ],
+    "payload": {
+      "model.layers.0.self_attn": {
+        "bytes": 131072,
+        "mismatched_bytes": 65536,
+        "untouched_sentinel_bytes": 65536,
+        "guard_block_intact": true,
+        "first_16_bytes": [
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10,
+          10
+        ]
+      }
+    }
+  }
+]
