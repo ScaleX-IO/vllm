@@ -414,17 +414,23 @@ def _make_kv_cache_config(
     )
 
 
-def _make_hybrid_gdn_kv_cache_config(tp_size: int, conv_layout: str = "DS") -> object:
+def _make_hybrid_gdn_kv_cache_config(
+    tp_size: int,
+    conv_layout: str = "DS",
+    *,
+    store_tp_size: int = 4,
+    num_heads: int = 2,
+) -> object:
     from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
     from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 
     full = FullAttentionSpec(
-        block_size=1600 // tp_size,
-        num_kv_heads=1,
+        block_size=400 * store_tp_size // tp_size,
+        num_kv_heads=max(1, num_heads // tp_size),
         head_size=64,
         dtype=None,
     )
-    local_factor = 4 // tp_size
+    local_factor = store_tp_size // tp_size
     conv_shape = (6 * local_factor, 3)
     if conv_layout == "SD":
         conv_shape = conv_shape[::-1]
@@ -2404,13 +2410,27 @@ def test_worker_enables_store_tp_layout(
 
 
 @pytest.mark.parametrize("conv_layout", ["DS", "SD"])
+@pytest.mark.parametrize(
+    ("extra_config", "store_tp", "num_heads", "topologies"),
+    [
+        ({"store_tp_size": 4}, 4, 2, [(2, 0), (4, 1)]),
+        (
+            {"enable_store_tp_lcm": True, "tp_sizes": [4, 3]},
+            12,
+            12,
+            [(4, 0), (3, 0)],
+        ),
+    ],
+)
 def test_hybrid_gdn_workers_share_group_aware_store_tp_namespace(
-    tmp_path, monkeypatch, conv_layout
+    tmp_path, monkeypatch, conv_layout, extra_config, store_tp, num_heads, topologies
 ):
     store = MagicMock()
     store.setup.return_value = 0
     _install_fake_mooncake(monkeypatch, store)
-    monkeypatch.setattr(_FakeModelConfig, "get_total_num_kv_heads", lambda _self: 2)
+    monkeypatch.setattr(
+        _FakeModelConfig, "get_total_num_kv_heads", lambda _self: num_heads
+    )
     monkeypatch.setenv("VLLM_SSM_CONV_STATE_LAYOUT", conv_layout)
     monkeypatch.setenv(
         "MOONCAKE_CONFIG_PATH",
@@ -2425,16 +2445,18 @@ def test_hybrid_gdn_workers_share_group_aware_store_tp_namespace(
     )
 
     workers = []
-    for tp_size, tp_rank in ((2, 0), (4, 1)):
+    for tp_size, tp_rank in topologies:
         _patch_worker_runtime(monkeypatch, tp_size=tp_size, tp_rank=tp_rank)
         config = _make_vllm_config(
-            extra_config={"store_tp_size": 4},
+            extra_config=extra_config,
             tensor_parallel_size=tp_size,
             prefix_match_unit=16,
         )
-        kv_cache_config = _make_hybrid_gdn_kv_cache_config(tp_size, conv_layout)
+        kv_cache_config = _make_hybrid_gdn_kv_cache_config(
+            tp_size, conv_layout, store_tp_size=store_tp, num_heads=num_heads
+        )
         store_worker = worker.MooncakeStoreWorker(config, kv_cache_config)
-        assert store_worker.store_tp_size == 4
+        assert store_worker.store_tp_size == store_tp
         assert isinstance(store_worker.token_dbs[0].store_layout, LBHNCStoreLayout)
         assert isinstance(store_worker.token_dbs[1].store_layout, MambaStoreLayout)
         assert store_worker.token_dbs[0].chunk_size == 16
@@ -2447,8 +2469,8 @@ def test_hybrid_gdn_workers_share_group_aware_store_tp_namespace(
             )
             == 16
         )
-        assert len(store_worker._lookup_key_prefixes[0]) == 2
-        assert len(store_worker._lookup_key_prefixes[1]) == 4
+        assert len(store_worker._lookup_key_prefixes[0]) == min(num_heads, store_tp)
+        assert len(store_worker._lookup_key_prefixes[1]) == store_tp
         workers.append(store_worker)
 
     full_key_tp2 = workers[0].token_dbs[0].store_layout.key_for(0, BlockHash(b"h"))
@@ -2510,6 +2532,33 @@ def test_hybrid_gdn_falls_back_from_incompatible_store_config(
     ("extra_config", "expected"),
     [
         ({"store_tp_size": 4}, 4),
+        ({"enable_store_tp_lcm": True, "tp_sizes": [4, 3]}, 12),
+        ({"enable_store_tp_lcm": True, "tp_sizes": [6, 4, 3, 2, 4]}, 12),
+        (
+            {
+                "enable_store_tp_lcm": True,
+                "tp_sizes": [4, 3],
+                "prefill_tp_sizes": [4, 2],
+                "store_tp_size": 4,
+            },
+            12,
+        ),
+        ({"enable_store_tp_lcm": False, "tp_sizes": [4, 3]}, None),
+        ({"store_tp_size": 4, "tp_sizes": [4, 3]}, 4),
+        ({"enable_store_tp_lcm": True, "tp_sizes": []}, None),
+        ({"enable_store_tp_lcm": True, "tp_sizes": [3, False]}, None),
+        ({"enable_store_tp_lcm": True, "tp_sizes": [3, 0]}, None),
+        ({"enable_store_tp_lcm": True, "tp_sizes": [3, -2]}, None),
+        ({"enable_store_tp_lcm": True, "tp_sizes": [3, 2.0]}, None),
+        ({"enable_store_tp_lcm": True, "tp_sizes": "4,3"}, None),
+        (
+            {
+                "enable_store_tp_lcm": True,
+                "tp_sizes": None,
+                "prefill_tp_sizes": [4, 2],
+            },
+            None,
+        ),
         (
             {
                 "enable_store_tp_lcm": True,
@@ -2537,11 +2586,51 @@ def test_resolve_store_tp_size(extra_config: dict[str, object], expected: int | 
     assert worker.resolve_store_tp_size(extra_config) == expected
 
 
-def test_lcm_store_tp_gives_prefill_and_decode_common_namespace(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("tp_config", "num_heads", "store_tp", "topologies"),
+    [
+        (
+            {"prefill_tp_sizes": [4, 2]},
+            8,
+            4,
+            [
+                (4, 2, "kv_both", (2,)),
+                (2, 1, "kv_both", (2, 3)),
+                (2, 1, "kv_consumer", (2, 3)),
+            ],
+        ),
+        (
+            {"tp_sizes": [4, 3]},
+            12,
+            12,
+            [
+                (4, 0, "kv_both", (0, 1, 2)),
+                (3, 0, "kv_consumer", (0, 1, 2, 3)),
+                (4, 0, "kv_consumer", (0, 1, 2)),
+            ],
+        ),
+        (
+            {"tp_sizes": [6, 4, 3, 2]},
+            24,
+            12,
+            [
+                (6, 1, "kv_both", (2, 3)),
+                (4, 0, "kv_both", (0, 1, 2)),
+                (3, 0, "kv_consumer", (0, 1, 2, 3)),
+                (2, 0, "kv_consumer", (0, 1, 2, 3, 4, 5)),
+            ],
+        ),
+    ],
+)
+def test_lcm_store_tp_gives_prefill_and_decode_common_namespace(
+    tmp_path, monkeypatch, tp_config, num_heads, store_tp, topologies
+):
     store = MagicMock()
     store.setup.return_value = 0
     _install_fake_mooncake(monkeypatch, store)
-    monkeypatch.setattr(_FakeModelConfig, "get_total_num_kv_heads", lambda _self: 8)
+    monkeypatch.setattr(
+        _FakeModelConfig, "get_total_num_kv_heads", lambda _self: num_heads
+    )
     monkeypatch.setenv(
         "MOONCAKE_CONFIG_PATH",
         _write_mooncake_config(
@@ -2555,15 +2644,10 @@ def test_lcm_store_tp_gives_prefill_and_decode_common_namespace(tmp_path, monkey
     )
     lcm_config = {
         "enable_store_tp_lcm": True,
-        "prefill_tp_sizes": [4, 2],
+        **tp_config,
     }
 
     workers = []
-    topologies = [
-        (4, 2, "kv_both", (2,)),
-        (2, 1, "kv_both", (2, 3)),
-        (2, 1, "kv_consumer", (2, 3)),
-    ]
     for tp_size, tp_rank, kv_role, expected_shards in topologies:
         _patch_worker_runtime(
             monkeypatch,
@@ -2575,9 +2659,9 @@ def test_lcm_store_tp_gives_prefill_and_decode_common_namespace(tmp_path, monkey
             extra_config["save_decode_cache"] = True
         store_worker = worker.MooncakeStoreWorker(
             _make_vllm_config(extra_config=extra_config, kv_role=kv_role),
-            _make_kv_cache_config(num_kv_heads=8 // tp_size),
+            _make_kv_cache_config(num_kv_heads=num_heads // tp_size),
         )
-        assert store_worker.store_tp_size == 4
+        assert store_worker.store_tp_size == store_tp
         assert isinstance(store_worker.token_dbs[0].store_layout, LBHNCStoreLayout)
         assert store_worker.token_dbs[0].store_layout.local_shard_ids == expected_shards
         workers.append(store_worker)
@@ -2590,6 +2674,7 @@ def test_lcm_store_tp_gives_prefill_and_decode_common_namespace(tmp_path, monkey
     assert workers[-1].can_put
 
 
+@pytest.mark.parametrize("config_key", ["prefill_tp_sizes", "tp_sizes"])
 @pytest.mark.parametrize(
     ("tp_size", "prefill_tp_sizes"),
     [
@@ -2602,6 +2687,7 @@ def test_lcm_store_tp_gives_prefill_and_decode_common_namespace(tmp_path, monkey
 def test_lcm_store_tp_falls_back_when_topology_is_incompatible(
     tmp_path,
     monkeypatch,
+    config_key,
     tp_size: int,
     prefill_tp_sizes: list[int],
 ):
@@ -2626,7 +2712,7 @@ def test_lcm_store_tp_falls_back_when_topology_is_incompatible(
         _make_vllm_config(
             extra_config={
                 "enable_store_tp_lcm": True,
-                "prefill_tp_sizes": prefill_tp_sizes,
+                config_key: prefill_tp_sizes,
             }
         ),
         _make_kv_cache_config(num_kv_heads=max(1, 8 // tp_size)),
