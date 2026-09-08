@@ -1,0 +1,179 @@
+[
+  {
+    "kind": "dense",
+    "p_tp": 1,
+    "d_tp": 8,
+    "reader_rank": 2,
+    "version": "head",
+    "responses": [
+      {
+        "status": 0,
+        "ok_reqs": [
+          "d"
+        ]
+      }
+    ],
+    "copies": [
+      {
+        "producer_rank": 0,
+        "src_offset_in_page": 4096,
+        "dst_offset_in_page": 0,
+        "length": 4096
+      }
+    ],
+    "producer_page_bytes": 16384,
+    "producer_content_bytes": 16384,
+    "producer_head_slots": 4,
+    "consumer_page_bytes": 4096,
+    "consumer_content_bytes": 4096,
+    "consumer_head_slots": 1,
+    "content_bytes": 4096,
+    "mismatched_content_bytes": 0,
+    "untouched_content_bytes": 0,
+    "expected_slot_values": [
+      11
+    ],
+    "actual_slot_values": [
+      11
+    ],
+    "case": "gqa_fan_out_control",
+    "expect": "correct"
+  },
+  {
+    "kind": "dense",
+    "p_tp": 8,
+    "d_tp": 2,
+    "reader_rank": 0,
+    "version": "head",
+    "responses": [
+      {
+        "status": 0,
+        "ok_reqs": [
+          "d"
+        ]
+      },
+      {
+        "status": 0,
+        "ok_reqs": [
+          "d"
+        ]
+      },
+      {
+        "status": 0,
+        "ok_reqs": [
+          "d"
+        ]
+      },
+      {
+        "status": 0,
+        "ok_reqs": [
+          "d"
+        ]
+      }
+    ],
+    "copies": [
+      {
+        "producer_rank": 0,
+        "src_offset_in_page": 0,
+        "dst_offset_in_page": 0,
+        "length": 4096
+      },
+      {
+        "producer_rank": 2,
+        "src_offset_in_page": 0,
+        "dst_offset_in_page": 4096,
+        "length": 4096
+      }
+    ],
+    "producer_page_bytes": 4096,
+    "producer_content_bytes": 4096,
+    "producer_head_slots": 1,
+    "consumer_page_bytes": 8192,
+    "consumer_content_bytes": 8192,
+    "consumer_head_slots": 2,
+    "content_bytes": 8192,
+    "mismatched_content_bytes": 0,
+    "untouched_content_bytes": 0,
+    "expected_slot_values": [
+      10,
+      11
+    ],
+    "actual_slot_values": [
+      10,
+      11
+    ],
+    "case": "gqa_fan_in_control",
+    "expect": "correct"
+  },
+  {
+    "kind": "padded",
+    "p_tp": 1,
+    "d_tp": 8,
+    "reader_rank": 2,
+    "version": "base",
+    "responses": [
+      {
+        "status": 2,
+        "err_msg": "Mooncake source KV region length does not match the consumer TP ratio at region 0: local=36864, remote=9216, tp_ratio=-8."
+      }
+    ],
+    "copies": [],
+    "producer_page_bytes": 36864,
+    "producer_content_bytes": 32768,
+    "producer_head_slots": 4,
+    "consumer_page_bytes": 9216,
+    "consumer_content_bytes": 8192,
+    "consumer_head_slots": 1,
+    "content_bytes": 8192,
+    "mismatched_content_bytes": 8192,
+    "untouched_content_bytes": 8192,
+    "expected_slot_values": [
+      11
+    ],
+    "actual_slot_values": [
+      253
+    ],
+    "case": "base_padded_page",
+    "expect": "reject"
+  },
+  {
+    "kind": "padded",
+    "p_tp": 1,
+    "d_tp": 8,
+    "reader_rank": 2,
+    "version": "head",
+    "responses": [
+      {
+        "status": 0,
+        "ok_reqs": [
+          "d"
+        ]
+      }
+    ],
+    "copies": [
+      {
+        "producer_rank": 0,
+        "src_offset_in_page": 9216,
+        "dst_offset_in_page": 0,
+        "length": 9216
+      }
+    ],
+    "producer_page_bytes": 36864,
+    "producer_content_bytes": 32768,
+    "producer_head_slots": 4,
+    "consumer_page_bytes": 9216,
+    "consumer_content_bytes": 8192,
+    "consumer_head_slots": 1,
+    "content_bytes": 8192,
+    "mismatched_content_bytes": 1024,
+    "untouched_content_bytes": 0,
+    "expected_slot_values": [
+      11
+    ],
+    "actual_slot_values": [
+      11
+    ],
+    "case": "padded_page",
+    "expect": "corrupt"
+  }
+]
