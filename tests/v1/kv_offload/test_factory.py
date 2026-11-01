@@ -23,7 +23,7 @@ from vllm.v1.kv_offload.config import (
 )
 from vllm.v1.kv_offload.cpu.common import CPUOffloadingInfo
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
-from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
+from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec, HybridOffloadingSpec
 from vllm.v1.kv_offload.factory import OffloadingSpecFactory
 from vllm.v1.kv_offload.tiering.manager import CPUPrimaryTierOffloadingManager
 from vllm.v1.kv_offload.tiering.spec import TieringOffloadingSpec
@@ -63,6 +63,60 @@ def test_pre_registered_specs_can_be_imported():
 def test_cpu_spec_registered():
     cls = OffloadingSpecFactory._registry["CPUOffloadingSpec"]()
     assert cls is CPUOffloadingSpec
+
+
+@pytest.mark.parametrize("slots", [1, 2])
+def test_hybrid_budget_reserves_both_streaming_pools(tmp_path, slots):
+    spec = _create_spec(
+        spec_name="HybridOffloadingSpec",
+        worker_kv_bytes_per_block=4096,
+        cpu_bytes_to_use=16 * 4096,
+        extra_config={
+            "disk_path": str(tmp_path / "cache"),
+            "disk_bytes_to_use": 64 * 4096,
+            "num_buffer_slots": slots,
+        },
+    )
+    assert isinstance(spec, HybridOffloadingSpec)
+    assert spec.num_cpu_blocks == 16 - 2 * slots - 6
+    assert spec.num_disk_blocks == 64
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"world_size": 2},
+        {"blocks_per_chunk": 2},
+        {"worker_kv_bytes_per_block": 1234},
+        {"cpu_bytes_to_use": 4096},
+        {"groups": (OffloadingGroupConfig(16, ("layer",), 0, 4),)},
+    ],
+)
+def test_hybrid_rejects_unsupported_layouts_and_budgets(tmp_path, options):
+    config = {
+        "spec_name": "HybridOffloadingSpec",
+        "worker_kv_bytes_per_block": 4096,
+        "extra_config": {
+            "disk_path": str(tmp_path / "cache"),
+            "disk_bytes_to_use": 64 * 4096,
+        },
+    }
+    config.update(options)
+    with pytest.raises(ValueError, match="Hybrid KV Backend"):
+        _create_spec(**config)
+
+
+def test_hybrid_rejects_buffered_io(tmp_path):
+    with pytest.raises(ValueError, match="O_DIRECT"):
+        _create_spec(
+            spec_name="HybridOffloadingSpec",
+            worker_kv_bytes_per_block=4096,
+            extra_config={
+                "disk_path": str(tmp_path / "cache"),
+                "disk_bytes_to_use": 64 * 4096,
+                "use_page_cache": True,
+            },
+        )
 
 
 def test_tiering_spec_registered():

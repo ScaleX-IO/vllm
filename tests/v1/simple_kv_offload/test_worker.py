@@ -9,10 +9,12 @@ read partially written / stale blocks and silently corrupt the CPU cache.
 
 from __future__ import annotations
 
+import ctypes
 import time
 from contextlib import nullcontext
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
@@ -63,6 +65,50 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunne
 from vllm.v1.worker.utils import allocate_kv_cache
 
 NUM_BLOCKS = 64
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA driver API")
+def test_null_batch_copy_symbol_falls_back_to_real_cuda_copies(monkeypatch):
+    from cuda.bindings import driver as drv
+
+    from vllm.v1.simple_kv_offload.cuda_mem_ops import _resolve_batch_memcpy
+
+    source = torch.full((2, 4096), 37, dtype=torch.int8, pin_memory=True)
+    target = torch.zeros_like(source, device="cuda")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    monkeypatch.setattr(
+        drv,
+        "cuGetProcAddress",
+        lambda *args: (
+            drv.CUresult.CUDA_SUCCESS,
+            0,
+            drv.CUdriverProcAddressQueryResult.CU_GET_PROC_ADDRESS_SYMBOL_NOT_FOUND,
+        ),
+    )
+    fn, _ = _resolve_batch_memcpy()
+    src = np.array([row.data_ptr() for row in source], dtype=np.uint64)
+    dst = np.array([row.data_ptr() for row in target], dtype=np.uint64)
+    sizes = np.array([4096, 4096], dtype=np.uint64)
+    failed = ctypes.c_size_t()
+    assert (
+        fn(
+            dst.ctypes.data,
+            src.ctypes.data,
+            sizes.ctypes.data,
+            2,
+            0,
+            None,
+            0,
+            ctypes.byref(failed),
+            stream.cuda_stream,
+        )
+        == 0
+    )
+    stream.synchronize()
+    assert torch.equal(target.cpu(), source)
+
+
 BLOCK_BYTES = 4096
 ITERS = 30
 # Keep the compute stream busy so the KV write lands late; this makes the

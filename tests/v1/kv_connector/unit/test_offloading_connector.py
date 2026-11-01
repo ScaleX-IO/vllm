@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import socket
 import threading
 import time
@@ -79,6 +80,51 @@ _FIRST_EVENT_POLL_MS = 10_000 if current_platform.is_rocm() else 1000
 # Hard ceiling (seconds) on how long get_new_cpu_stored_events may loop,
 # to prevent hangs if non-CPU events keep arriving indefinitely.
 _EVENT_DRAIN_TIMEOUT = 60
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA-only prototype")
+def test_hybrid_backend_restores_prefix_larger_than_host_budget(vllm_runner, tmp_path):
+    model = os.environ.get("HYBRID_KV_TEST_MODEL", "Qwen/Qwen3-0.6B")
+    config = KVTransferConfig(
+        kv_connector="OffloadingConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={
+            "spec_name": "HybridOffloadingSpec",
+            "blocks_per_chunk": 1,
+            "cpu_bytes_to_use": 32 << 20,
+            "disk_bytes_to_use": 512 << 20,
+            "disk_path": str(tmp_path / "hybrid"),
+        },
+    )
+    with vllm_runner(
+        model,
+        max_model_len=2048,
+        enforce_eager=True,
+        block_size=16,
+        max_num_seqs=1,
+        gpu_memory_utilization=float(
+            os.environ.get("HYBRID_KV_TEST_GPU_MEMORY", "0.5")
+        ),
+        enable_prefix_caching=True,
+        enable_chunked_prefill=True,
+        max_num_batched_tokens=256,
+        kv_transfer_config=config,
+    ) as runner:
+        llm = runner.llm
+        tokens = llm.get_tokenizer().encode("A sequence of integers: 1, 2, 3, 4, 5. ")
+        prompt = TokensPrompt(prompt_token_ids=(tokens * 1025)[:1025])
+        sampling = SamplingParams(temperature=0, max_tokens=1, logprobs=5)
+        [cold] = llm.generate(prompt, sampling, use_tqdm=False)
+        _wait_for_prefix_cache_reset(llm)
+        [restored] = llm.generate(prompt, sampling, use_tqdm=False)
+        assert restored.num_cached_tokens == 1024
+        expected = cold.outputs[0].logprobs[0]
+        actual = restored.outputs[0].logprobs[0]
+        assert actual.keys() == expected.keys()
+        for token_id in expected:
+            assert actual[token_id].logprob == pytest.approx(
+                expected[token_id].logprob, abs=1e-2
+            )
 
 
 class MockSubscriber:

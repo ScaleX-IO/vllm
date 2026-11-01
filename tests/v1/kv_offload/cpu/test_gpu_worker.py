@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
 import logging
+import os
 import random
+import threading
 import time
 import uuid
 from unittest.mock import MagicMock
@@ -22,8 +24,11 @@ from vllm.v1.kv_offload.base import (
     TransferResult,
 )
 from vllm.v1.kv_offload.cpu import gpu_worker
-from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
-from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
+from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec, HybridLoadStoreSpec
+from vllm.v1.kv_offload.cpu.gpu_worker import (
+    CPUOffloadingWorker,
+    HybridOffloadingWorker,
+)
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 
 NUM_GPU_BLOCKS = [64]
@@ -36,6 +41,142 @@ DEVICE_TYPE = current_platform.device_type
 DEVICES = [f"{DEVICE_TYPE}:0"]
 NUM_MAPPINGS = [3]
 NUM_MAPPINGS_PER_GROUP = [2]
+
+
+def _wait_hybrid(worker, job_id, timeout=10):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        results = worker.get_finished()
+        if results:
+            assert len(results) == 1 and results[0].job_id == job_id
+            return results[0]
+        time.sleep(0.001)
+    raise AssertionError(f"Hybrid transfer {job_id} did not complete")
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA-only prototype")
+@pytest.mark.parametrize("num_slots", [1, 2])
+@pytest.mark.parametrize("hot_blocks", [0, 2, 8])
+def test_hybrid_direct_io_restores_mixed_blocks(tmp_path, num_slots, hot_blocks):
+    import fcntl
+
+    tensors = [
+        torch.randint(0, 127, (16, 4096), dtype=torch.int8, device="cuda")
+        for _ in range(2)
+    ]
+    expected = [t[:8].clone() for t in tensors]
+    caches = CanonicalKVCaches(
+        [CanonicalKVCacheTensor(t, 4096) for t in tensors],
+        [[CanonicalKVCacheRef(i, 4096) for i in range(2)]],
+    )
+    path = str(tmp_path / "hybrid.kv")
+    worker = HybridOffloadingWorker(
+        caches,
+        hot_blocks,
+        8,
+        path,
+        num_slots,
+        1,
+        (hot_blocks + 2 * num_slots) * 8192 + (3 if hot_blocks else 2) * 8192,
+        8192,
+    )
+    try:
+        descriptors = []
+        for entry in os.scandir("/proc/self/fd"):
+            try:
+                if os.readlink(entry.path) == path:
+                    descriptors.append(int(entry.name))
+            except FileNotFoundError:
+                continue
+        assert len(descriptors) == 1
+        assert fcntl.fcntl(descriptors[0], fcntl.F_GETFL) & os.O_DIRECT
+        hot_ids = [-1] * (8 - hot_blocks) + list(range(hot_blocks))
+        store = HybridLoadStoreSpec(hot_ids, list(range(8)))
+        worker.submit_store(1, GPULoadStoreSpec(list(range(8)), [8], [0]), store)
+        assert _wait_hybrid(worker, 1).success
+        load = HybridLoadStoreSpec(
+            hot_ids, list(range(8 - hot_blocks)) + [-1] * hot_blocks
+        )
+        # Noncontiguous destinations detect accidental compacting of mixed hits.
+        destinations = [15, 8, 14, 9, 13, 10, 12, 11]
+        worker.submit_load(2, load, GPULoadStoreSpec(destinations, [8], [0]))
+        assert _wait_hybrid(worker, 2).success
+        for tensor, reference in zip(tensors, expected):
+            assert torch.equal(tensor[destinations], reference)
+    finally:
+        worker.shutdown()
+    assert not os.path.exists(path)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA-only prototype")
+def test_hybrid_short_read_reports_failure_and_accepts_next_job(tmp_path):
+    tensor = torch.full((2, 4096), 42, dtype=torch.int8, device="cuda")
+    caches = CanonicalKVCaches(
+        [CanonicalKVCacheTensor(tensor, 4096)], [[CanonicalKVCacheRef(0, 4096)]]
+    )
+    path = str(tmp_path / "hybrid.kv")
+    worker = HybridOffloadingWorker(caches, 1, 1, path, 2, 1, 8 * 4096, 4096)
+    try:
+        source = GPULoadStoreSpec([0], [1], [0])
+        worker.submit_store(1, source, HybridLoadStoreSpec([0], [0]))
+        assert _wait_hybrid(worker, 1).success
+        os.truncate(path, 0)
+        target = GPULoadStoreSpec([1], [1], [0])
+        worker.submit_load(2, HybridLoadStoreSpec([-1], [0]), target)
+        assert not _wait_hybrid(worker, 2).success
+        worker.submit_load(3, HybridLoadStoreSpec([0], [-1]), target)
+        assert _wait_hybrid(worker, 3).success
+        assert torch.equal(tensor[0], tensor[1])
+    finally:
+        worker.shutdown()
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA-only prototype")
+def test_hybrid_hot_batch_overlaps_blocked_read_without_completing_parent(
+    tmp_path, monkeypatch
+):
+    """Gate the external disk read to observe one bounded hot batch in its bubble."""
+    tensor = torch.zeros((6, 4096), dtype=torch.int8, device="cuda")
+    tensor[:3].fill_(42)
+    caches = CanonicalKVCaches(
+        [CanonicalKVCacheTensor(tensor, 4096)], [[CanonicalKVCacheRef(0, 4096)]]
+    )
+    worker = HybridOffloadingWorker(
+        caches, 2, 3, str(tmp_path / "hybrid.kv"), 2, 1, 9 * 4096, 4096
+    )
+    entered, release = threading.Event(), threading.Event()
+    read = os.preadv
+
+    def blocked_read(*args, **kwargs):
+        entered.set()
+        if not release.wait(timeout=10):
+            raise OSError("Test disk read was not released")
+        return read(*args, **kwargs)
+
+    try:
+        worker.submit_store(
+            1,
+            GPULoadStoreSpec([0, 1, 2], [3], [0]),
+            HybridLoadStoreSpec([-1, 0, 1], [0, 1, 2]),
+        )
+        assert _wait_hybrid(worker, 1).success
+        monkeypatch.setattr(os, "preadv", blocked_read)
+        worker.submit_load(
+            2,
+            HybridLoadStoreSpec([-1, 0, 1], [0, -1, -1]),
+            GPULoadStoreSpec([3, 4, 5], [3], [0]),
+        )
+        assert entered.wait(timeout=10)
+        torch.accelerator.synchronize()
+        assert torch.equal(tensor[4], tensor[1])
+        assert torch.count_nonzero(tensor[[3, 5]]) == 0
+        assert worker.get_finished() == []
+        release.set()
+        assert _wait_hybrid(worker, 2).success
+        assert torch.equal(tensor[:3], tensor[3:])
+    finally:
+        release.set()
+        worker.shutdown()
 
 
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm-specific test")

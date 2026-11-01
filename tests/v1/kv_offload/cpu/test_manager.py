@@ -17,8 +17,12 @@ from vllm.v1.kv_offload.base import (
     ReqContext,
     make_offload_key,
 )
-from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec, CPUOffloadingMetrics
-from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+from vllm.v1.kv_offload.cpu.common import (
+    CPULoadStoreSpec,
+    CPUOffloadingMetrics,
+    HybridLoadStoreSpec,
+)
+from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager, HybridOffloadingManager
 from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
 from vllm.v1.kv_offload.cpu.policies.base import ChunkStatus
 from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
@@ -76,6 +80,97 @@ def to_key(int_hash: int) -> OffloadKey:
 
 def to_keys(int_hashes: list[int]) -> list[OffloadKey]:
     return [to_key(i) for i in int_hashes]
+
+
+def test_hybrid_load_larger_than_hot_capacity_and_no_promotion():
+    manager = HybridOffloadingManager(2, 8)
+    ctx = make_req_context("hybrid")
+    keys = to_keys(list(range(6)))
+    output = manager.prepare_store(keys, ctx)
+    assert output is not None and output.keys_to_store == keys
+    assert manager.lookup(keys[0], ctx) == LookupResult.HIT_PENDING
+    manager.complete_store(keys, ctx)
+    spec = manager.prepare_load(keys, ctx)
+    assert isinstance(spec, HybridLoadStoreSpec)
+    assert spec.cpu_ids[:4] == [-1] * 4
+    assert all(i >= 0 for i in spec.disk_ids[:4])
+    assert spec.disk_ids[4:] == [-1] * 2
+    assert all(i >= 0 for i in spec.cpu_ids[4:])
+    manager.complete_load(keys, ctx)
+    assert manager.prepare_load(keys, ctx) == spec
+    manager.complete_load(keys, ctx)
+
+
+def test_hybrid_pins_hot_and_disk_until_load_completion():
+    manager = HybridOffloadingManager(1, 2)
+    ctx = make_req_context("reader")
+    keys = to_keys([0, 1])
+    manager.prepare_store(keys, ctx)
+    manager.complete_store(keys, ctx)
+    manager.prepare_load(keys, ctx)
+    assert manager.prepare_store(to_keys([2, 3]), ctx) is None
+    output = manager.prepare_store(to_keys([2]), ctx)
+    assert output is not None
+    assert output.store_spec.cpu_ids == [-1]
+    manager.complete_store(output.keys_to_store, ctx)
+    manager.complete_load(keys, ctx)
+    assert manager.prepare_store(to_keys([3]), ctx) is not None
+
+
+def test_hybrid_completion_does_not_commit_another_requests_disk_store():
+    from vllm.v1.kv_offload.base import TierFilter, TierMatcher
+
+    manager = HybridOffloadingManager(1, 4)
+    first, second = make_req_context("first"), make_req_context("second")
+    a, b = to_keys([0, 1])
+    manager.prepare_store([a, b], first)
+    manager.complete_store([b], first)
+    other = manager.prepare_store([a], second)
+    assert other is not None and other.keys_to_store == []
+    manager.complete_store(other.keys_to_store, second)
+    assert manager.lookup(a, second) == LookupResult.HIT_PENDING
+    second.load_tier_filter = TierFilter((TierMatcher(medium=Medium.STORAGE),))
+    assert manager.lookup(a, second) == LookupResult.HIT_PENDING
+    manager.complete_store([a], first, success=False)
+    assert manager.lookup(a, second) == LookupResult.MISS
+
+
+def test_hybrid_failed_store_releases_both_tiers():
+    manager = HybridOffloadingManager(2, 2)
+    ctx = make_req_context("failed")
+    keys = to_keys([0, 1])
+    manager.prepare_store(keys, ctx)
+    manager.complete_store(keys, ctx, success=False)
+    assert all(manager.lookup(key, ctx) == LookupResult.MISS for key in keys)
+    assert manager.prepare_store(to_keys([2, 3]), ctx) is not None
+
+
+def test_hybrid_repeated_load_keeps_original_source_pinned():
+    manager = HybridOffloadingManager(1, 4)
+    writer, reader = make_req_context("writer"), make_req_context("reader")
+    a, b = to_keys([0, 1])
+    manager.prepare_store([a, b], writer)
+    manager.complete_store([a, b], writer)
+    first = manager.prepare_load([a], reader)
+    assert first.cpu_ids == [-1]
+    manager.prepare_store([a], writer)
+    manager.complete_store([a], writer)
+    assert manager.prepare_load([a], reader) == first
+    manager.complete_load([a], reader)
+    manager.complete_load([a], reader)
+    assert manager.prepare_load([a], reader).disk_ids == [-1]
+    manager.complete_load([a], reader)
+
+
+def test_hybrid_reset_discards_lookup_and_request_transfer_state():
+    manager = HybridOffloadingManager(2, 8)
+    ctx = make_req_context("reset")
+    keys = to_keys([0, 1, 2])
+    manager.prepare_store(keys, ctx)
+    manager.complete_store(keys, ctx)
+    manager.reset_cache()
+    assert all(manager.lookup(key, ctx) == LookupResult.MISS for key in keys)
+    assert manager.prepare_store(keys, ctx) is not None
 
 
 def verify_store_output(

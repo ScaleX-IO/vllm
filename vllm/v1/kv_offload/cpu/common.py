@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from vllm.utils.math_utils import cdiv
-from vllm.v1.kv_offload.base import BlockIDsLoadStoreSpec, ConfigInfo
+from vllm.v1.kv_offload.base import BlockIDsLoadStoreSpec, ConfigInfo, LoadStoreSpec
 from vllm.v1.kv_offload.config import OffloadingConfig
 
 
@@ -70,3 +70,11 @@ def _kv_cache_size_tokens(config: OffloadingConfig, num_chunks: int) -> int | No
             group_chunks = min(group_chunks, group.sliding_window_size_in_chunks)
         chunks_per_request += group_chunks
     return num_chunks * max_model_len // chunks_per_request
+
+
+@dataclass
+class HybridLoadStoreSpec(LoadStoreSpec):
+    """One entry per GPU block; -1 means this tier does not participate."""
+
+    cpu_ids: list[int]
+    disk_ids: list[int]

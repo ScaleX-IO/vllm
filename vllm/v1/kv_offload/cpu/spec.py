@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from typing import Any
 
 from typing_extensions import override
@@ -18,8 +19,11 @@ from vllm.v1.kv_offload.base import (
 )
 from vllm.v1.kv_offload.config import OffloadingConfig
 from vllm.v1.kv_offload.cpu.common import CPUOffloadingInfo, CPUOffloadingMetrics
-from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
-from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+from vllm.v1.kv_offload.cpu.gpu_worker import (
+    CPUOffloadingWorker,
+    HybridOffloadingWorker,
+)
+from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager, HybridOffloadingManager
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 
 # Split the shared region into this many shm files so workers pre-fault them
@@ -225,4 +229,90 @@ class CPUOffloadingSpec(OffloadingSpec):
             self._worker = self.create_worker(kv_caches)
 
         assert self._worker is not None
+        return self._worker
+
+
+class HybridOffloadingSpec(OffloadingSpec):
+    """Experimental single-worker hot CPU cache and direct-I/O disk backend."""
+
+    @classmethod
+    def build_metric_definitions(
+        cls, extra_config: dict[str, Any]
+    ) -> dict[str, OffloadingMetricMetadata]:
+        return CPUOffloadingSpec.build_metric_definitions(extra_config)
+
+    def __init__(self, config: OffloadingConfig):
+        super().__init__(config)
+        if (
+            config.parallel.world_size != 1
+            or config.parallel.data_parallel_size != 1
+            or len(config.groups) != 1
+            or config.groups[0].sliding_window_size_in_chunks is not None
+            or config.cache.blocks_per_chunk != 1
+            or config.canonical_layout
+            or config.replicated_layout
+        ):
+            raise ValueError(
+                "Hybrid KV Backend supports one GPU, one full-attention group, "
+                "worker-local layout and one GPU block per offload chunk"
+            )
+        if not getattr(os, "O_DIRECT", 0) or self.extra_config.get(
+            "use_page_cache", False
+        ):
+            raise ValueError("Hybrid KV Backend requires O_DIRECT")
+        if config.enable_kv_cache_events:
+            raise ValueError("Hybrid KV Backend does not yet publish KV events")
+        if self.extra_config.get("eviction_policy", "lru") != "lru":
+            raise ValueError("Hybrid KV Backend currently supports LRU only")
+        self.cpu_budget = int(self.extra_config.get("cpu_bytes_to_use", 0))
+        disk_budget = int(self.extra_config.get("disk_bytes_to_use", 0))
+        self.num_buffer_slots = int(self.extra_config.get("num_buffer_slots", 2))
+        self.hot_batch_blocks = int(self.extra_config.get("hot_batch_blocks", 1))
+        self.disk_path = self.extra_config.get("disk_path")
+        if not self.disk_path or not os.path.isabs(self.disk_path):
+            raise ValueError("Hybrid KV Backend requires an absolute disk_path")
+        if self.num_buffer_slots not in (1, 2) or self.hot_batch_blocks < 1:
+            raise ValueError("Use 1-2 streaming slots and a positive hot_batch_blocks")
+        self.block_bytes = config.worker_kv_bytes_per_block
+        if self.block_bytes <= 0 or self.block_bytes % 4096:
+            raise ValueError("Hybrid KV Backend requires 4096-aligned block bytes")
+        # Up to separate K and V tensors per layer; the worker verifies the
+        # actual allocation against this budget before allocating anything.
+        alignment_reserve = 6 * 4096 * len(config.groups[0].layer_names)
+        staging_bytes = 2 * self.num_buffer_slots * self.block_bytes + alignment_reserve
+        self.num_cpu_blocks = (self.cpu_budget - staging_bytes) // self.block_bytes
+        self.num_disk_blocks = disk_budget // self.block_bytes
+        if self.num_cpu_blocks < 0 or self.num_disk_blocks < 1:
+            raise ValueError(
+                "Hybrid KV Backend budgets cannot fit streaming buffers/disk"
+            )
+        self._manager: HybridOffloadingManager | None = None
+        self._worker: HybridOffloadingWorker | None = None
+
+    def get_manager(self) -> OffloadingManager:
+        if self._manager is None:
+            self._manager = HybridOffloadingManager(
+                self.num_cpu_blocks, self.num_disk_blocks
+            )
+        return self._manager
+
+    def get_worker(self, kv_caches: CanonicalKVCaches) -> OffloadingWorker:
+        if self._worker is None:
+            if not current_platform.is_cuda():
+                raise ValueError("Hybrid KV Backend currently requires CUDA")
+            # Each engine gets an ephemeral file, even when disk_path is shared.
+            import hashlib
+
+            engine = hashlib.sha256(self.config.engine_id.encode()).hexdigest()[:16]
+            path = f"{self.disk_path}.{engine}.rank_0"
+            self._worker = HybridOffloadingWorker(
+                kv_caches,
+                self.num_cpu_blocks,
+                self.num_disk_blocks,
+                path,
+                self.num_buffer_slots,
+                self.hot_batch_blocks,
+                self.cpu_budget,
+                self.block_bytes,
+            )
         return self._worker

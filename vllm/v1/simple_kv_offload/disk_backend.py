@@ -13,6 +13,7 @@ import contextlib
 import os
 import queue
 import threading
+from collections.abc import Callable
 
 import torch
 
@@ -25,6 +26,7 @@ from vllm.v1.simple_kv_offload.cuda_mem_ops import (
     build_params,
     copy_blocks,
     pin_tensor,
+    unpin_tensor,
 )
 
 logger = init_logger(__name__)
@@ -194,9 +196,23 @@ class DiskBackend:
         event_idx: int,
         events_list: list[tuple[int, torch.Event]],
         wait_event: torch.Event | None = None,
+        before_read: Callable[[], bool] | None = None,
+        before_store: Callable[[], None] | None = None,
+        on_error: Callable[[Exception], None] | None = None,
     ) -> None:
         q = self._store_queue if is_store else self._load_queue
-        q.put((src_blocks, dst_blocks, event_idx, events_list, wait_event))
+        q.put(
+            (
+                src_blocks,
+                dst_blocks,
+                event_idx,
+                events_list,
+                wait_event,
+                before_read,
+                before_store,
+                on_error,
+            )
+        )
 
     def shutdown(self) -> None:
         if self._shutdown:
@@ -208,8 +224,6 @@ class DiskBackend:
             self._store_thread.join(timeout=10.0)
         if self._load_thread is not None:
             self._load_thread.join(timeout=10.0)
-        if self._fd < 0:
-            return
         # Slot contents can encode user prompts, so drop the name now rather
         # than leaving them readable until the next run overwrites the file.
         # Unlinking only removes the directory entry: any thread still holding
@@ -230,8 +244,15 @@ class DiskBackend:
                 self._fd,
             )
             return
-        os.close(self._fd)
-        self._fd = -1
+        if self._fd >= 0:
+            os.close(self._fd)
+            self._fd = -1
+        for pool in (self._store_buffer_caches, self._load_buffer_caches):
+            for tensor in pool.values():
+                unpin_tensor(tensor)
+            pool.clear()
+        self._store_slot_views.clear()
+        self._load_slot_views.clear()
 
     def _store_loop(
         self,
@@ -243,13 +264,34 @@ class DiskBackend:
             item = self._store_queue.get()
             if item is None:
                 return
-            (src_blocks, dst_blocks, event_idx, events_list, wait_event) = item
-            if wait_event is not None:
-                stream.wait_event(wait_event)
-            self._do_store(src_blocks, dst_blocks, stream)
+            self._run_job(item, stream, is_store=True)
+
+    def _run_job(self, item: tuple, stream: torch.cuda.Stream, is_store: bool) -> None:
+        (src, dst, idx, events, wait, before_read, before_store, on_error) = item
+        try:
+            if wait is not None:
+                stream.wait_event(wait)
+            if is_store:
+                if before_store is not None:
+                    before_store()
+                self._do_store(src, dst, stream)
+            else:
+                self._do_load(src, dst, stream, before_read)
             event = torch.Event()
             event.record(stream)
-            events_list.append((event_idx, event))
+            events.append((idx, event))
+        except Exception as exc:
+            if on_error is None:
+                raise
+            # A failed read/write can leave earlier DMA using a staging slot.
+            # Do not release the parent job's source/destination pins early.
+            try:
+                stream.synchronize()
+            except Exception as drain_error:
+                logger.exception("Could not drain failed disk transfer")
+                on_error(RuntimeError(f"Could not drain disk transfer: {drain_error}"))
+                return
+            on_error(exc)
 
     def _writev_slot(self, buf_slot: int, file_offset: int) -> None:
         written = os.pwritev(self._fd, self._store_slot_views[buf_slot], file_offset)
@@ -277,13 +319,7 @@ class DiskBackend:
             item = self._load_queue.get()
             if item is None:
                 return
-            (src_blocks, dst_blocks, event_idx, events_list, wait_event) = item
-            if wait_event is not None:
-                stream.wait_event(wait_event)
-            self._do_load(src_blocks, dst_blocks, stream)
-            event = torch.Event()
-            event.record(stream)
-            events_list.append((event_idx, event))
+            self._run_job(item, stream, is_store=False)
 
     def _do_store(
         self,
@@ -319,6 +355,7 @@ class DiskBackend:
         disk_slots: list[int],
         gpu_blocks: list[int],
         stream: torch.cuda.Stream,
+        before_read: Callable[[], bool] | None = None,
     ) -> None:
         """Disk (preadv) -> buffer -> GPU (DMA), interleaved double-buffer."""
         assert self._load_params is not None
@@ -331,6 +368,8 @@ class DiskBackend:
             if prev is not None:
                 prev.synchronize()
 
+            if before_read is not None:
+                before_read()
             self._readv_slot(buf_slot, disk_slot * self._total_block_bytes)
 
             copy_blocks([buf_slot], [gpu_blk], self._load_params)
@@ -338,6 +377,9 @@ class DiskBackend:
             ev.record(stream)
             prev_dma_events[buf_slot] = ev
 
+        if before_read is not None:
+            while before_read():
+                pass
         for ev in prev_dma_events:
             if ev is not None:
                 ev.synchronize()

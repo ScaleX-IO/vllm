@@ -7,12 +7,13 @@ This guide covers configuration of the [`OffloadingConnector`](disagg_prefill.md
 
 ## Overview
 
-Two specs are available, selected by the `spec_name` key in `kv_connector_extra_config`:
+Specs are selected by the `spec_name` key in `kv_connector_extra_config`:
 
 - `CPUOffloadingSpec` (default): single CPU tier. Completed GPU blocks are copied into pinned host memory.
 - `TieringOffloadingSpec`: multi-tier. A CPU primary tier plus one or more secondary tiers.
+- `HybridOffloadingSpec` (experimental): CPU hot cache with bounded disk streaming.
 
-Only the CPU primary tier has direct GPU access. Secondary tiers cannot read from or write to GPU memory; all GPU↔secondary transfers are staged through the CPU primary tier.
+With `TieringOffloadingSpec`, only the CPU primary tier has direct GPU access. Secondary tiers cannot read from or write to GPU memory; all GPU↔secondary transfers are staged through the CPU primary tier.
 
 ```mermaid
 flowchart LR
@@ -68,6 +69,87 @@ vllm serve <model> \
     }
   }'
 ```
+
+## Hybrid KV Backend (Experimental)
+
+`HybridOffloadingSpec` reuses SimpleCPU's `DiskBackend` file and I/O pipeline.
+Disk hits stream directly through fixed pinned buffers, so restoring a prefix
+does not require the whole prefix to fit in the CPU hot cache.
+
+```mermaid
+flowchart LR
+    GPU[GPU KV blocks] -->|store| Hot[CPU hot cache]
+    GPU --> Store[1-2 store slots]
+    Store -->|O_DIRECT| SSD[Ephemeral SSD file]
+    SSD -->|O_DIRECT| Load[1-2 load slots]
+    Load --> GPU
+    Hot -->|bounded batches during disk reads| GPU
+```
+
+```bash
+vllm serve Qwen/Qwen3-4B --block-size 16 \
+  --kv-transfer-config '{
+    "kv_connector": "OffloadingConnector",
+    "kv_role": "kv_both",
+    "kv_connector_extra_config": {
+      "spec_name": "HybridOffloadingSpec",
+      "cpu_bytes_to_use": 536870912,
+      "disk_bytes_to_use": 17179869184,
+      "disk_path": "/mnt/nvme/vllm-kv",
+      "blocks_per_chunk": 1,
+      "num_buffer_slots": 2,
+      "hot_batch_blocks": 1
+    }
+  }'
+```
+
+| Setting | Meaning |
+| --- | --- |
+| `cpu_bytes_to_use` | Total KV payload and staging allocation budget per worker. Both I/O pools and alignment reserves are subtracted before sizing the hot cache. Excludes Python metadata and allocator bookkeeping. |
+| `disk_bytes_to_use` | Maximum file size, rounded down to whole KV blocks. The sparse file does not reserve physical disk space. |
+| `disk_path` | Absolute file prefix on a filesystem supporting `O_DIRECT`; an engine/rank suffix is added. Use a private directory. |
+| `num_buffer_slots` | 1 or 2 slots **per direction**, default 2. |
+| `hot_batch_blocks` | Maximum hot blocks submitted before each disk read, default 1. |
+
+```mermaid
+sequenceDiagram
+    participant S as Scheduler
+    participant W as Worker
+    participant D as Disk thread
+    participant G as CUDA load stream
+    S->>S: Choose hot/disk source and pin each source
+    S->>W: One parent load job
+    W->>D: Queue cold blocks and hot iterator
+    loop Each cold block
+        D->>D: Wait before reusing a staging slot
+        D->>G: Submit a bounded hot batch
+        D->>D: Blocking preadv overlaps queued hot DMA
+        D->>G: Submit the cold block
+    end
+    D->>G: Drain remaining hot batches and record final event
+    W->>S: Report completion after the event
+    S->>S: Release source pins; GPU blocks may be consumed
+```
+
+Stores allocate disk slots and opportunistically retain a suffix of the offered
+blocks in the hot cache. Both caches use LRU; a busy hot cache does not prevent
+a disk store. Disk reads do not promote into the hot cache. A store becomes
+readable only after all its copies and writes complete. I/O failures report a
+failed parent transfer after draining queued DMA; preemption/reset waits for
+the submitted job to drain before reusing its blocks.
+
+The prototype supports one CUDA GPU, one full-attention group, one GPU block per
+offload chunk, and contiguous worker-local tensor pages aligned to 4096 bytes.
+Unsupported layouts, insufficient budgets, buffered I/O, and KV event publishing
+are rejected. Load jobs share one FIFO; expedited loads currently drain that
+queue. There is no early cancellation or hot-cache promotion policy. Copies use
+the same asynchronous batch DMA primitives as SimpleCPU. Performance benefits
+still require workload measurements.
+
+Files and indexes are process-local and ephemeral. Normal shutdown unlinks the
+file; a crash can leave a file behind, but it is never recovered as a valid KV
+cache. Cross-process persistence and integration with external cache systems
+are outside this prototype.
 
 ## Multi-Tier Setup
 

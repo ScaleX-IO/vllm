@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import OrderedDict
 from collections.abc import Collection, Iterable, Sequence
+from copy import copy
 from dataclasses import dataclass, field, replace
 
 from typing_extensions import override
@@ -12,6 +13,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
 from vllm.v1.kv_offload.base import (
     ConfigInfoMapping,
     LoadStoreSpec,
+    Locality,
     LookupResult,
     Medium,
     OffloadingEvent,
@@ -26,6 +28,7 @@ from vllm.v1.kv_offload.cpu.common import (
     CPULoadStoreSpec,
     CPUOffloadingInfo,
     CPUOffloadingMetrics,
+    HybridLoadStoreSpec,
 )
 from vllm.v1.kv_offload.cpu.policies.base import CachePolicy, ChunkStatus
 from vllm.v1.kv_offload.cpu.policies.factory import CachePolicyFactory
@@ -518,3 +521,172 @@ class CPUOffloadingManager(OffloadingManager):
             self.stores_skipped_in_current_batch = 0
 
         return stats
+
+
+@dataclass
+class _HybridRequestState:
+    owner: object
+    generation: int
+    contexts: tuple[ReqContext, ReqContext]
+    loads: dict[OffloadKey, list[int]] = field(default_factory=dict)
+    stores: dict[OffloadKey, list[int]] = field(default_factory=dict)
+
+
+class HybridOffloadingManager(OffloadingManager):
+    """Independent CPU hot and disk caches, with no read promotion.
+
+    Both tiers reuse CPUOffloadingManager's allocation and pinning rules.
+    Stores populate disk and opportunistically retain a suffix in CPU.
+    """
+
+    def __init__(self, num_cpu_chunks: int, num_disk_chunks: int):
+        self.hot_capacity = num_cpu_chunks
+        self.tiers = (
+            CPUOffloadingManager(num_cpu_chunks),
+            CPUOffloadingManager(num_disk_chunks),
+        )
+        self.tiers[1].medium = Medium.STORAGE
+        self._generation = 0
+
+    def _state(self, ctx: ReqContext) -> _HybridRequestState:
+        state = ctx.get_state(_HybridRequestState)
+        if (
+            state is None
+            or state.owner is not self
+            or state.generation != self._generation
+        ):
+            contexts = (copy(ctx), copy(ctx))
+            for child in contexts:
+                child._state = {}
+            state = _HybridRequestState(self, self._generation, contexts)
+            ctx.set_state(state)
+        return state
+
+    def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
+        state = self._state(req_context)
+        for tier, ctx in zip(self.tiers, state.contexts):
+            tier.on_new_request(ctx)
+        return RequestOffloadingContext()
+
+    def _lookups(self, key: OffloadKey, ctx: ReqContext) -> list[LookupResult]:
+        return [
+            tier.lookup(key, child)
+            if tier.medium == Medium.CPU
+            or ctx.load_tier_filter.allows(tier.medium, Locality.LOCAL)
+            else LookupResult.MISS
+            for tier, child in zip(self.tiers, self._state(ctx).contexts)
+        ]
+
+    def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+        results = self._lookups(key, req_context)
+        if LookupResult.HIT in results:
+            return LookupResult.HIT
+        if LookupResult.HIT_PENDING in results:
+            return LookupResult.HIT_PENDING
+        return LookupResult.MISS
+
+    def get_load_source(
+        self, key: OffloadKey, req_context: ReqContext
+    ) -> CacheHitSource:
+        pins = self._state(req_context).loads.get(key)
+        tier = (
+            pins[0] if pins else self._lookups(key, req_context).index(LookupResult.HIT)
+        )
+        return (CacheHitSource.HOST, CacheHitSource.DISK)[tier]
+
+    def prepare_load(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> HybridLoadStoreSpec:
+        state = self._state(req_context)
+        ids: tuple[list[int], list[int]] = ([], [])
+        for key in keys:
+            # Completion carries keys, not per-tier IDs. Keep repeated loads
+            # on the same pinned source even if a second tier becomes ready.
+            idx = (
+                state.loads[key][0]
+                if key in state.loads
+                else self._lookups(key, req_context).index(LookupResult.HIT)
+            )
+            spec = self.tiers[idx].prepare_load([key], state.contexts[idx])
+            assert isinstance(spec, CPULoadStoreSpec)
+            for i in range(2):
+                ids[i].append(int(spec.chunk_ids[0]) if i == idx else -1)
+            state.loads.setdefault(key, []).append(idx)
+        return HybridLoadStoreSpec(*ids)
+
+    def complete_load(self, keys: Collection[OffloadKey], req_context: ReqContext):
+        state = self._state(req_context)
+        for key in keys:
+            idx = state.loads[key].pop(0)
+            self.tiers[idx].complete_load([key], state.contexts[idx])
+            if not state.loads[key]:
+                del state.loads[key]
+
+    def prepare_store(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> PrepareStoreOutput | None:
+        keys = list(keys)
+        state = self._state(req_context)
+        # Do not start a second store for a key whose first copy is pending:
+        # complete_store receives keys rather than individual allocation IDs.
+        keys = [
+            key
+            for key in keys
+            if all(
+                tier.lookup(key, ctx) != LookupResult.HIT_PENDING
+                for tier, ctx in zip(self.tiers, state.contexts)
+            )
+        ]
+        disk = self.tiers[1].prepare_store(keys, state.contexts[1])
+        if disk is None:
+            return None
+        hot = self.tiers[0].prepare_store(
+            keys[-self.hot_capacity :] if self.hot_capacity else [], state.contexts[0]
+        )
+        mappings: list[dict[OffloadKey, int]] = [{}, {}]
+        evicted: list[OffloadKey] = []
+        for idx, output in enumerate((hot, disk)):
+            if output is None:
+                continue
+            assert isinstance(output.store_spec, CPULoadStoreSpec)
+            mappings[idx] = dict(zip(output.keys_to_store, output.store_spec.chunk_ids))
+            evicted.extend(output.evicted_keys)
+            for key in output.keys_to_store:
+                state.stores.setdefault(key, []).append(idx)
+        stored = [key for key in keys if any(key in m for m in mappings)]
+        return PrepareStoreOutput(
+            stored,
+            HybridLoadStoreSpec(
+                *[[int(m.get(key, -1)) for key in stored] for m in mappings]
+            ),
+            list(dict.fromkeys(evicted)),
+        )
+
+    def complete_store(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+        success: bool = True,
+    ) -> None:
+        state = self._state(req_context)
+        for key in keys:
+            for idx in state.stores.pop(key, []):
+                self.tiers[idx].complete_store([key], state.contexts[idx], success)
+
+    def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
+        for tier, ctx in zip(self.tiers, self._state(req_context).contexts):
+            tier.touch(keys, ctx)
+
+    def on_request_finished(self, req_context: ReqContext) -> None:
+        for tier, ctx in zip(self.tiers, self._state(req_context).contexts):
+            tier.on_request_finished(ctx)
+
+    def reset_cache(self) -> None:
+        for tier in self.tiers:
+            tier.reset_cache()
+        self._generation += 1
+
+    def get_stats(self) -> OffloadingConnectorStats | None:
+        # Drain the disk allocator's observations without labeling them as CPU.
+        self.tiers[1].get_stats()
+        return self.tiers[0].get_stats()

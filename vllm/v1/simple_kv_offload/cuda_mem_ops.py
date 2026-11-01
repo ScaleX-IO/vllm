@@ -33,6 +33,13 @@ def pin_tensor(tensor: torch.Tensor) -> None:
         raise RuntimeError(f"cudaHostRegister failed: {err}")
 
 
+def unpin_tensor(tensor: torch.Tensor) -> None:
+    """Release host registration after all transfers using the tensor drain."""
+    err = torch.cuda.cudart().cudaHostUnregister(tensor.data_ptr())
+    if err.value != 0:
+        raise RuntimeError(f"cudaHostUnregister failed: {err}")
+
+
 class _CUmemLocation(ctypes.Structure):
     _fields_ = [("type", ctypes.c_uint), ("id", ctypes.c_int)]
 
@@ -94,8 +101,7 @@ def _resolve_batch_memcpy() -> tuple[Any, int]:
     """Resolve the batch-memcpy entry point and its ``numAttrs`` (one-time).
 
     CUDA uses ``cuMemcpyBatchAsync``; ROCm uses ``hipMemcpyBatchAsync``.
-    Raises ``RuntimeError`` if the symbol is unavailable (old CUDA driver,
-    ROCm < 7.1, unusual install).
+    Older CUDA drivers use ordered individual copies. ROCm requires 7.1+.
     """
     if current_platform.is_rocm():
         try:
@@ -122,10 +128,42 @@ def _resolve_batch_memcpy() -> tuple[Any, int]:
 
     from cuda.bindings import driver as drv
 
-    err, ptr, _ = drv.cuGetProcAddress(b"cuMemcpyBatchAsync", 12080, 0)
+    err, ptr, status = drv.cuGetProcAddress(b"cuMemcpyBatchAsync", 12080, 0)
     if err != drv.CUresult.CUDA_SUCCESS:
         raise RuntimeError(f"cuGetProcAddress(cuMemcpyBatchAsync) failed: {err}")
+    if not ptr:
+        logger.warning_once(
+            "cuMemcpyBatchAsync unavailable (%s); using ordered cuMemcpyAsync copies",
+            status,
+        )
+        return _copy_individually, 1
     return _BATCH_MEMCPY_FUNC_TYPE(ptr), 1
+
+
+def _copy_individually(
+    dsts: int,
+    srcs: int,
+    sizes: int,
+    count: int,
+    attrs: int,
+    attrs_idx: Any,
+    num_attrs: int,
+    fail_idx: Any,
+    stream: int,
+) -> int:
+    """Preserve stream ordering on CUDA drivers without batch-copy support."""
+    from cuda.bindings import driver as drv
+
+    array_type = ctypes.POINTER(ctypes.c_uint64)
+    dst = ctypes.cast(dsts, array_type)
+    src = ctypes.cast(srcs, array_type)
+    size = ctypes.cast(sizes, array_type)
+    for i in range(count):
+        (err,) = drv.cuMemcpyAsync(dst[i], src[i], size[i], drv.CUstream(stream))
+        if err != drv.CUresult.CUDA_SUCCESS:
+            ctypes.cast(fail_idx, ctypes.POINTER(ctypes.c_size_t))[0] = i
+            return int(err)
+    return 0
 
 
 def _load_hip_runtime() -> ctypes.CDLL:

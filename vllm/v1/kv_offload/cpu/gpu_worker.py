@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+import threading
 import time
 from collections import deque
 from collections.abc import Iterator, Sequence
@@ -27,6 +28,7 @@ from vllm.v1.kv_offload.base import (
     OffloadingWorker,
     TransferResult,
 )
+from vllm.v1.kv_offload.cpu.common import HybridLoadStoreSpec
 from vllm.v1.kv_offload.cpu.host_register import host_register, host_unregister
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
@@ -996,3 +998,251 @@ class CPUOffloadingWorker(OffloadingWorker):
                     )
             self._mmap_region.cleanup()
             self._mmap_region = None
+
+
+@dataclass
+class _HybridTransfer:
+    done: threading.Event
+    success: bool = True
+
+
+class HybridOffloadingWorker(OffloadingWorker):
+    """Stream disk blocks through SimpleCPU slots and fill read gaps with hot DMA."""
+
+    def __init__(
+        self,
+        kv_caches: CanonicalKVCaches,
+        num_cpu_blocks: int,
+        num_disk_blocks: int,
+        disk_path: str,
+        num_buffer_slots: int,
+        hot_batch_blocks: int,
+        cpu_budget: int,
+        block_bytes: int,
+    ):
+        from vllm.v1.simple_kv_offload.cuda_mem_ops import (
+            CU_MEMCPY_SRC_ACCESS_ORDER_ANY,
+            CU_MEMCPY_SRC_ACCESS_ORDER_STREAM,
+            build_params,
+            pin_tensor,
+        )
+        from vllm.v1.simple_kv_offload.disk_backend import DiskBackend, _alloc_aligned
+
+        if len(kv_caches.group_data_refs) != 1:
+            raise ValueError("Hybrid KV Backend requires one full-attention group")
+        refs = kv_caches.group_data_refs[0]
+        if {ref.tensor_idx for ref in refs} != set(range(len(kv_caches.tensors))):
+            raise ValueError("Hybrid KV Backend requires worker-local whole pages")
+        self.gpu = {
+            str(i): t.tensor.view(torch.int8).view(-1, t.page_size_bytes)
+            for i, t in enumerate(kv_caches.tensors)
+        }
+        if not self.gpu or any(
+            not t.is_cuda or not t.is_contiguous() or t.shape[1] % 4096
+            for t in self.gpu.values()
+        ):
+            raise ValueError(
+                "Hybrid KV Backend requires contiguous, 4096-aligned CUDA pages"
+            )
+        actual_bytes = sum(t.shape[1] for t in self.gpu.values())
+        if actual_bytes != block_bytes:
+            raise ValueError(
+                "Hybrid KV Backend block size disagrees with worker layout"
+            )
+        allocation = (num_cpu_blocks + 2 * num_buffer_slots) * actual_bytes
+        allocation += (3 if num_cpu_blocks else 2) * 4096 * len(self.gpu)
+        if allocation > cpu_budget:
+            raise ValueError("Hybrid KV Backend buffers exceed cpu_bytes_to_use")
+        logger.info(
+            "Hybrid KV Backend: hot=%d blocks, staging=%d slots per direction, "
+            "hot batch=%d blocks, host allocation=%d bytes",
+            num_cpu_blocks,
+            num_buffer_slots,
+            hot_batch_blocks,
+            allocation,
+        )
+        device = next(iter(self.gpu.values())).device
+        self.load_stream = torch.cuda.Stream(device=device, priority=0)
+        self.store_stream = torch.cuda.Stream(device=device, priority=0)
+        self.hot_batch_blocks = hot_batch_blocks
+        self.hot: dict[str, torch.Tensor] = {}
+        self._jobs: dict[int, _HybridTransfer] = {}
+        self._events: list[tuple[int, torch.Event]] = []
+        self._fatal_error: Exception | None = None
+        self._closed = False
+        self.disk = DiskBackend()
+        try:
+            for name, tensor in self.gpu.items():
+                buf = (
+                    _alloc_aligned(num_cpu_blocks, tensor.shape[1])
+                    if num_cpu_blocks
+                    else torch.empty((0, tensor.shape[1]), dtype=torch.int8)
+                )
+                if num_cpu_blocks:
+                    pin_tensor(buf)
+                self.hot[name] = buf
+            self._hot_load_params = build_params(
+                self.hot,
+                self.gpu,
+                self.load_stream,
+                src_access_order=CU_MEMCPY_SRC_ACCESS_ORDER_ANY,
+            )
+            self._hot_store_params = build_params(
+                self.gpu,
+                self.hot,
+                self.store_stream,
+                src_access_order=CU_MEMCPY_SRC_ACCESS_ORDER_STREAM,
+            )
+            self.disk.init(
+                self.gpu,
+                device,
+                self.load_stream,
+                self.store_stream,
+                disk_path,
+                num_disk_blocks,
+                actual_bytes,
+                num_buffer_slots=num_buffer_slots,
+                use_page_cache=False,
+            )
+        except Exception:
+            self.shutdown()
+            raise
+
+    def _submit(
+        self,
+        job_id: int,
+        spec: HybridLoadStoreSpec,
+        gpu_spec: GPULoadStoreSpec,
+        is_store: bool,
+    ) -> bool:
+        from vllm.v1.simple_kv_offload.cuda_mem_ops import copy_blocks
+
+        if self._closed:
+            raise RuntimeError("Hybrid KV Backend is shut down")
+        if job_id in self._jobs:
+            raise ValueError(f"Duplicate transfer ID: {job_id}")
+        gpu_ids = gpu_spec.block_ids.tolist()
+        if len(gpu_spec.group_sizes) != 1 or not (
+            len(spec.cpu_ids) == len(spec.disk_ids) == len(gpu_ids)
+        ):
+            raise ValueError("Hybrid KV Backend requires one chunk per GPU block")
+        hot = [(c, g) for c, g in zip(spec.cpu_ids, gpu_ids) if c >= 0]
+        cold = [(d, g) for d, g in zip(spec.disk_ids, gpu_ids) if d >= 0]
+        stream = self.store_stream if is_store else self.load_stream
+        fence = torch.Event()
+        fence.record(torch.cuda.current_stream(stream.device))
+        job = _HybridTransfer(threading.Event())
+        self._jobs[job_id] = job
+        hot_iter = iter(hot)
+        previous_hot: torch.Event | None = None
+
+        def hot_batch() -> bool:
+            nonlocal previous_hot
+            # Bound queued hot DMA, including the tail after the last disk read.
+            if previous_hot is not None:
+                previous_hot.synchronize()
+            batch = []
+            for _ in range(self.hot_batch_blocks):
+                pair = next(hot_iter, None)
+                if pair is None:
+                    break
+                batch.append(pair)
+            if not batch:
+                return False
+            cpu_ids = [c for c, _ in batch]
+            gpu_ids = [g for _, g in batch]
+            copy_blocks(
+                gpu_ids if is_store else cpu_ids,
+                cpu_ids if is_store else gpu_ids,
+                self._hot_store_params if is_store else self._hot_load_params,
+            )
+            previous_hot = torch.Event()
+            previous_hot.record(stream)
+            return True
+
+        def store_hot() -> None:
+            while hot_batch():
+                pass
+
+        def failed(exc: Exception) -> None:
+            logger.error("Hybrid KV transfer %d failed: %s", job_id, exc)
+            if not isinstance(exc, OSError):
+                self._fatal_error = exc
+            job.success = False
+            job.done.set()
+
+        disk_ids = [d for d, _ in cold]
+        cold_gpu_ids = [g for _, g in cold]
+        self.disk.launch_copy(
+            cold_gpu_ids if is_store else disk_ids,
+            disk_ids if is_store else cold_gpu_ids,
+            is_store,
+            job_id,
+            self._events,
+            fence,
+            before_read=None if is_store else hot_batch,
+            before_store=store_hot if is_store else None,
+            on_error=failed,
+        )
+        return True
+
+    def submit_store(
+        self, job_id: int, src_spec: GPULoadStoreSpec, dst_spec: LoadStoreSpec
+    ) -> bool:
+        assert isinstance(dst_spec, HybridLoadStoreSpec)
+        return self._submit(job_id, dst_spec, src_spec, True)
+
+    def submit_load(
+        self,
+        job_id: int,
+        src_spec: LoadStoreSpec,
+        dst_spec: GPULoadStoreSpec,
+        expedited: bool = False,
+    ) -> bool:
+        assert isinstance(src_spec, HybridLoadStoreSpec)
+        return self._submit(job_id, src_spec, dst_spec, False)
+
+    def _poll(self) -> None:
+        if self._fatal_error is not None:
+            raise RuntimeError(
+                "Hybrid KV Backend CUDA transfer failed"
+            ) from self._fatal_error
+        pending = []
+        while self._events:
+            job_id, event = self._events.pop()
+            if event.query():
+                self._jobs[job_id].done.set()
+            else:
+                pending.append((job_id, event))
+        self._events.extend(pending)
+
+    def get_finished(self) -> list[TransferResult]:
+        self._poll()
+        finished = [
+            TransferResult(job_id, job.success)
+            for job_id, job in self._jobs.items()
+            if job.done.is_set()
+        ]
+        for result in finished:
+            del self._jobs[result.job_id]
+        return finished
+
+    def wait(self, job_ids: set[int]) -> None:
+        self._poll()
+        while any(j in self._jobs and not self._jobs[j].done.is_set() for j in job_ids):
+            self._poll()
+            time.sleep(0.001)
+        self._poll()
+
+    def shutdown(self) -> None:
+        if self._closed:
+            return
+        from vllm.v1.simple_kv_offload.cuda_mem_ops import unpin_tensor
+
+        self._closed = True
+        self.wait(set(self._jobs))
+        self.disk.shutdown()
+        for tensor in self.hot.values():
+            if tensor.numel():
+                unpin_tensor(tensor)
+        self.hot.clear()
