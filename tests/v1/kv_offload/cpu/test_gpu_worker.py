@@ -21,7 +21,9 @@ from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
     CanonicalKVCacheTensor,
     GPULoadStoreSpec,
+    ReqContext,
     TransferResult,
+    make_offload_key,
 )
 from vllm.v1.kv_offload.cpu import gpu_worker
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec, HybridLoadStoreSpec
@@ -29,6 +31,7 @@ from vllm.v1.kv_offload.cpu.gpu_worker import (
     CPUOffloadingWorker,
     HybridOffloadingWorker,
 )
+from vllm.v1.kv_offload.cpu.manager import HybridOffloadingManager
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 
 NUM_GPU_BLOCKS = [64]
@@ -57,7 +60,10 @@ def _wait_hybrid(worker, job_id, timeout=10):
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA-only prototype")
 @pytest.mark.parametrize("num_slots", [1, 2])
 @pytest.mark.parametrize("hot_blocks", [0, 2, 8])
-def test_hybrid_direct_io_restores_mixed_blocks(tmp_path, num_slots, hot_blocks):
+@pytest.mark.parametrize("leased_blocks", [0, 2, 6])
+def test_hybrid_direct_io_restores_mixed_blocks(
+    tmp_path, num_slots, hot_blocks, leased_blocks
+):
     import fcntl
 
     tensors = [
@@ -72,12 +78,13 @@ def test_hybrid_direct_io_restores_mixed_blocks(tmp_path, num_slots, hot_blocks)
     path = str(tmp_path / "hybrid.kv")
     worker = HybridOffloadingWorker(
         caches,
-        hot_blocks,
+        hot_blocks + leased_blocks,
         8,
         path,
         num_slots,
         1,
-        (hot_blocks + 2 * num_slots) * 8192 + (3 if hot_blocks else 2) * 8192,
+        (hot_blocks + leased_blocks + 2 * num_slots) * 8192
+        + (3 if hot_blocks + leased_blocks else 2) * 8192,
         8192,
     )
     try:
@@ -95,7 +102,11 @@ def test_hybrid_direct_io_restores_mixed_blocks(tmp_path, num_slots, hot_blocks)
         worker.submit_store(1, GPULoadStoreSpec(list(range(8)), [8], [0]), store)
         assert _wait_hybrid(worker, 1).success
         load = HybridLoadStoreSpec(
-            hot_ids, list(range(8 - hot_blocks)) + [-1] * hot_blocks
+            hot_ids,
+            list(range(8 - hot_blocks)) + [-1] * hot_blocks,
+            list(range(hot_blocks, hot_blocks + leased_blocks))
+            if hot_blocks < 8
+            else [],
         )
         # Noncontiguous destinations detect accidental compacting of mixed hits.
         destinations = [15, 8, 14, 9, 13, 10, 12, 11]
@@ -176,6 +187,132 @@ def test_hybrid_hot_batch_overlaps_blocked_read_without_completing_parent(
         assert torch.equal(tensor[:3], tensor[3:])
     finally:
         release.set()
+        worker.shutdown()
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA-only prototype")
+@pytest.mark.parametrize("readers", [1, 4, 16])
+def test_hybrid_shared_leases_survive_queued_loads_and_concurrent_store(
+    tmp_path, readers
+):
+    tensor = torch.randint(
+        0, 127, (256 + 128 * readers, 4096), dtype=torch.int8, device="cuda"
+    )
+    expected = tensor[:128].clone()
+    caches = CanonicalKVCaches(
+        [CanonicalKVCacheTensor(tensor, 4096)], [[CanonicalKVCacheRef(0, 4096)]]
+    )
+    manager = HybridOffloadingManager(16, 512)
+    worker = HybridOffloadingWorker(
+        caches, 16, 512, str(tmp_path / "leased.kv"), 2, 1, 23 * 4096, 4096
+    )
+    keys = [make_offload_key(str(i).encode(), 0) for i in range(512)]
+    writer = ReqContext(req_id="writer")
+    try:
+        store = manager.prepare_store(keys[:256], writer)
+        assert store is not None
+        worker.submit_store(
+            0, GPULoadStoreSpec(list(range(256)), [256], [0]), store.store_spec
+        )
+        assert _wait_hybrid(worker, 0).success
+        manager.complete_store(store.keys_to_store, writer)
+        contexts = {}
+        for job in range(1, readers + 1):
+            ctx = ReqContext(req_id=str(job))
+            load = manager.prepare_load(keys[:128], ctx)
+            assert 0 < len(load.staging_ids) <= 6
+            destinations = list(range(256 + (job - 1) * 128, 256 + job * 128))
+            worker.submit_load(job, load, GPULoadStoreSpec(destinations, [128], [0]))
+            contexts[job] = ctx
+        store = manager.prepare_store(keys[300:308], writer)
+        assert store is not None
+        worker.submit_store(
+            readers + 1, GPULoadStoreSpec(list(range(8)), [8], [0]), store.store_spec
+        )
+        worker.wait(set(range(1, readers + 2)))
+        completed = worker.get_finished()
+        assert {r.job_id for r in completed} == set(range(1, readers + 2))
+        assert all(r.success for r in completed)
+        for result in completed:
+            if result.job_id in contexts:
+                manager.complete_load(keys[:128], contexts[result.job_id])
+            else:
+                manager.complete_store(store.keys_to_store, writer)
+        for job in contexts:
+            assert torch.equal(
+                tensor[256 + (job - 1) * 128 : 256 + job * 128], expected
+            )
+        returned = manager.prepare_store(keys[400:416], writer)
+        assert returned is not None and isinstance(
+            returned.store_spec, HybridLoadStoreSpec
+        )
+        assert set(returned.store_spec.cpu_ids) == set(range(16))
+    finally:
+        worker.shutdown()
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA-only prototype")
+def test_hybrid_failed_parallel_read_waits_for_sibling_before_releasing_lease(
+    tmp_path, monkeypatch
+):
+    tensor = torch.full((8, 4096), 37, dtype=torch.int8, device="cuda")
+    caches = CanonicalKVCaches(
+        [CanonicalKVCacheTensor(tensor, 4096)], [[CanonicalKVCacheRef(0, 4096)]]
+    )
+    worker = HybridOffloadingWorker(
+        caches, 2, 4, str(tmp_path / "failure.kv"), 2, 1, 9 * 4096, 4096
+    )
+    failed, blocked, release, drained = (threading.Event() for _ in range(4))
+    read = os.preadv
+
+    def read_with_failure(fd, buffers, offset, *args):
+        if offset == 0:
+            assert blocked.wait(10)
+            failed.set()
+            raise OSError("Injected disk read failure")
+        if offset == 4096:
+            blocked.set()
+            assert release.wait(10)
+        return read(fd, buffers, offset, *args)
+
+    def wait_for_failure():
+        worker.wait({2})
+        drained.set()
+
+    waiter = threading.Thread(target=wait_for_failure)
+    try:
+        worker.submit_store(
+            1,
+            GPULoadStoreSpec([0, 1, 2, 3], [4], [0]),
+            HybridLoadStoreSpec([-1] * 4, [0, 1, 2, 3]),
+        )
+        assert _wait_hybrid(worker, 1).success
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "preadv", read_with_failure)
+            worker.submit_load(
+                2,
+                HybridLoadStoreSpec([-1] * 4, [0, 1, 2, 3], [0, 1]),
+                GPULoadStoreSpec([4, 5, 6, 7], [4], [0]),
+            )
+            assert failed.wait(10)
+            waiter.start()
+            assert not drained.wait(0.2), (
+                "Lease released while a sibling read is active"
+            )
+            release.set()
+            assert drained.wait(10)
+            assert not _wait_hybrid(worker, 2).success
+        worker.submit_load(
+            3,
+            HybridLoadStoreSpec([-1] * 4, [0, 1, 2, 3], [0, 1]),
+            GPULoadStoreSpec([4, 5, 6, 7], [4], [0]),
+        )
+        assert _wait_hybrid(worker, 3).success
+        assert torch.equal(tensor[:4], tensor[4:])
+    finally:
+        release.set()
+        if waiter.ident is not None:
+            waiter.join(10)
         worker.shutdown()
 
 

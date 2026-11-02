@@ -14,6 +14,8 @@ import os
 import queue
 import threading
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, wait
+from typing import NamedTuple
 
 import torch
 
@@ -33,6 +35,14 @@ logger = init_logger(__name__)
 
 O_DIRECT = getattr(os, "O_DIRECT", 0)
 _ALIGNMENT = 4096
+
+
+class DiskReadSlot(NamedTuple):
+    """An already pinned row and its DMA mapping; ownership stays with the caller."""
+
+    views: list[memoryview]
+    params: BatchMemcpyParams
+    block_id: int
 
 
 def _alloc_aligned(num_slots: int, bpb: int) -> torch.Tensor:
@@ -79,6 +89,7 @@ class DiskBackend:
         self._load_slot_views: list[list[memoryview]] = []
         self._per_tensor_bpb: list[int] = []
         self._tensor_names: list[str] = []
+        self._read_executor: ThreadPoolExecutor | None = None
 
     def init(
         self,
@@ -91,6 +102,7 @@ class DiskBackend:
         total_block_bytes: int,
         num_buffer_slots: int = 2,
         use_page_cache: bool = False,
+        max_load_slots: int | None = None,
     ) -> None:
         self._load_stream = load_stream
         self._store_stream = store_stream
@@ -148,6 +160,10 @@ class DiskBackend:
             load_stream,
             src_access_order=CU_MEMCPY_SRC_ACCESS_ORDER_ANY,
         )
+        if max_load_slots is not None and max_load_slots > num_buffer_slots:
+            self._read_executor = ThreadPoolExecutor(
+                max_workers=max_load_slots, thread_name_prefix="kv_read"
+            )
 
         os.makedirs(os.path.dirname(disk_path) or ".", exist_ok=True)
         # Slot contents never outlive the process, so unlink then O_EXCL rather
@@ -199,6 +215,7 @@ class DiskBackend:
         before_read: Callable[[], bool] | None = None,
         before_store: Callable[[], None] | None = None,
         on_error: Callable[[Exception], None] | None = None,
+        extra_load_slots: list[DiskReadSlot] | None = None,
     ) -> None:
         q = self._store_queue if is_store else self._load_queue
         q.put(
@@ -211,6 +228,7 @@ class DiskBackend:
                 before_read,
                 before_store,
                 on_error,
+                extra_load_slots,
             )
         )
 
@@ -247,6 +265,8 @@ class DiskBackend:
         if self._fd >= 0:
             os.close(self._fd)
             self._fd = -1
+        if self._read_executor is not None:
+            self._read_executor.shutdown(wait=True)
         for pool in (self._store_buffer_caches, self._load_buffer_caches):
             for tensor in pool.values():
                 unpin_tensor(tensor)
@@ -267,16 +287,18 @@ class DiskBackend:
             self._run_job(item, stream, is_store=True)
 
     def _run_job(self, item: tuple, stream: torch.cuda.Stream, is_store: bool) -> None:
-        (src, dst, idx, events, wait, before_read, before_store, on_error) = item
+        (src, dst, idx, events, fence, before_read, before_store, on_error, slots) = (
+            item
+        )
         try:
-            if wait is not None:
-                stream.wait_event(wait)
+            if fence is not None:
+                stream.wait_event(fence)
             if is_store:
                 if before_store is not None:
                     before_store()
                 self._do_store(src, dst, stream)
             else:
-                self._do_load(src, dst, stream, before_read)
+                self._do_load(src, dst, stream, before_read, slots)
             event = torch.Event()
             event.record(stream)
             events.append((idx, event))
@@ -302,7 +324,10 @@ class DiskBackend:
             )
 
     def _readv_slot(self, buf_slot: int, file_offset: int) -> None:
-        bytes_read = os.preadv(self._fd, self._load_slot_views[buf_slot], file_offset)
+        self._read_into(self._load_slot_views[buf_slot], file_offset)
+
+    def _read_into(self, views: list[memoryview], file_offset: int) -> None:
+        bytes_read = os.preadv(self._fd, views, file_offset)
         if bytes_read < self._total_block_bytes:
             raise OSError(
                 f"Short read: expected {self._total_block_bytes} bytes, "
@@ -356,9 +381,15 @@ class DiskBackend:
         gpu_blocks: list[int],
         stream: torch.cuda.Stream,
         before_read: Callable[[], bool] | None = None,
+        extra_load_slots: list[DiskReadSlot] | None = None,
     ) -> None:
         """Disk (preadv) -> buffer -> GPU (DMA), interleaved double-buffer."""
         assert self._load_params is not None
+        if extra_load_slots:
+            self._do_load_parallel(
+                disk_slots, gpu_blocks, stream, before_read, extra_load_slots
+            )
+            return
         n = self._num_buffer_slots
         prev_dma_events: list[torch.Event | None] = [None] * n
 
@@ -383,3 +414,53 @@ class DiskBackend:
         for ev in prev_dma_events:
             if ev is not None:
                 ev.synchronize()
+
+    def _do_load_parallel(
+        self,
+        disk_blocks: list[int],
+        gpu_blocks: list[int],
+        stream: torch.cuda.Stream,
+        before_read: Callable[[], bool] | None,
+        extra_slots: list[DiskReadSlot],
+    ) -> None:
+        assert self._load_params is not None and self._read_executor is not None
+        executor = self._read_executor
+        slots = [
+            DiskReadSlot(views, self._load_params, i)
+            for i, views in enumerate(self._load_slot_views)
+        ] + extra_slots
+        slots = slots[: len(disk_blocks)]
+        pending = []
+
+        def read(index: int):
+            if before_read is not None:
+                before_read()
+            return executor.submit(
+                self._read_into,
+                slots[index % len(slots)].views,
+                disk_blocks[index] * self._total_block_bytes,
+            )
+
+        try:
+            for i in range(len(slots)):
+                pending.append(read(i))
+            for i, gpu_block in enumerate(gpu_blocks):
+                slot_index = i % len(slots)
+                pending[slot_index].result()
+                slot = slots[slot_index]
+                copy_blocks([slot.block_id], [gpu_block], slot.params)
+                if i + len(slots) < len(disk_blocks):
+                    # A slot may be reused only after its previous DMA drains.
+                    event = torch.Event()
+                    event.record(stream)
+                    event.synchronize()
+                    pending[slot_index] = read(i + len(slots))
+            if before_read is not None:
+                while before_read():
+                    pass
+        finally:
+            # A failed read must not return leases while sibling reads use them.
+            for future in pending:
+                future.cancel()
+            wait(pending)
+            stream.synchronize()

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -78,3 +78,4 @@ class HybridLoadStoreSpec(LoadStoreSpec):
 
     cpu_ids: list[int]
     disk_ids: list[int]
+    staging_ids: list[int] = field(default_factory=list)

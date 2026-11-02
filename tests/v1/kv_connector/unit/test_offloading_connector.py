@@ -83,7 +83,10 @@ _EVENT_DRAIN_TIMEOUT = 60
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA-only prototype")
-def test_hybrid_backend_restores_prefix_larger_than_host_budget(vllm_runner, tmp_path):
+@pytest.mark.parametrize("max_slots", [2, 8])
+def test_hybrid_backend_restores_prefix_larger_than_host_budget(
+    vllm_runner, tmp_path, max_slots
+):
     model = os.environ.get("HYBRID_KV_TEST_MODEL", "Qwen/Qwen3-0.6B")
     config = KVTransferConfig(
         kv_connector="OffloadingConnector",
@@ -92,18 +95,24 @@ def test_hybrid_backend_restores_prefix_larger_than_host_budget(vllm_runner, tmp
             "spec_name": "HybridOffloadingSpec",
             "blocks_per_chunk": 1,
             "cpu_bytes_to_use": 32 << 20,
-            "disk_bytes_to_use": 512 << 20,
+            "disk_bytes_to_use": 1024 << 20,
             "disk_path": str(tmp_path / "hybrid"),
+            "max_load_slots": max_slots,
         },
     )
     with vllm_runner(
         model,
-        max_model_len=2048,
+        max_model_len=4096,
         enforce_eager=True,
         block_size=16,
         max_num_seqs=1,
         gpu_memory_utilization=float(
             os.environ.get("HYBRID_KV_TEST_GPU_MEMORY", "0.5")
+        ),
+        kv_cache_memory_bytes=(
+            int(os.environ["HYBRID_KV_TEST_GPU_KV_MIB"]) << 20
+            if "HYBRID_KV_TEST_GPU_KV_MIB" in os.environ
+            else None
         ),
         enable_prefix_caching=True,
         enable_chunked_prefill=True,
@@ -112,12 +121,17 @@ def test_hybrid_backend_restores_prefix_larger_than_host_budget(vllm_runner, tmp
     ) as runner:
         llm = runner.llm
         tokens = llm.get_tokenizer().encode("A sequence of integers: 1, 2, 3, 4, 5. ")
-        prompt = TokensPrompt(prompt_token_ids=(tokens * 1025)[:1025])
+        prompt = TokensPrompt(prompt_token_ids=(tokens * 2049)[:2049])
         sampling = SamplingParams(temperature=0, max_tokens=1, logprobs=5)
         [cold] = llm.generate(prompt, sampling, use_tqdm=False)
+        # Evict the first prefix's hot rows so a full SSD reload can lease them.
+        other = TokensPrompt(
+            prompt_token_ids=[tokens[1]] + prompt["prompt_token_ids"][1:]
+        )
+        llm.generate(other, sampling, use_tqdm=False)
         _wait_for_prefix_cache_reset(llm)
         [restored] = llm.generate(prompt, sampling, use_tqdm=False)
-        assert restored.num_cached_tokens == 1024
+        assert restored.num_cached_tokens == 2048
         expected = cold.outputs[0].logprobs[0]
         actual = restored.outputs[0].logprobs[0]
         assert actual.keys() == expected.keys()

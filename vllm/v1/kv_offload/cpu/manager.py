@@ -103,9 +103,9 @@ class CPUOffloadingManager(OffloadingManager):
     def _get_num_free_chunks(self) -> int:
         return len(self._free_list) + self._num_chunks - self._num_allocated_chunks
 
-    def _allocate_chunks(self, keys: list[OffloadKey]) -> list[ChunkStatus]:
-        num_fresh = min(len(keys), self._num_chunks - self._num_allocated_chunks)
-        num_reused = len(keys) - num_fresh
+    def _allocate_chunks(self, count: int) -> list[ChunkStatus]:
+        num_fresh = min(count, self._num_chunks - self._num_allocated_chunks)
+        num_reused = count - num_fresh
         assert len(self._free_list) >= num_reused
 
         # allocate fresh chunks
@@ -121,6 +121,18 @@ class CPUOffloadingManager(OffloadingManager):
 
     def _free_chunk(self, chunk: ChunkStatus) -> None:
         self._free_list.append(chunk.chunk_id)
+
+    def _lease_chunks(self, count: int) -> list[int]:
+        """Borrow available rows for staging without evicting in-flight copies."""
+        free = self._get_num_free_chunks()
+        count = min(count, free + self._num_evictable_cache_chunks)
+        evicted = self._policy.evict(max(0, count - free), set())
+        if evicted is None:
+            return []
+        self._num_evictable_cache_chunks -= len(evicted)
+        for _, chunk in evicted:
+            self._free_chunk(chunk)
+        return [chunk.chunk_id for chunk in self._allocate_chunks(count)]
 
     def _get_load_store_spec(
         self,
@@ -355,7 +367,7 @@ class CPUOffloadingManager(OffloadingManager):
                 )
             )
 
-        chunks = self._allocate_chunks(keys_to_store)
+        chunks = self._allocate_chunks(len(keys_to_store))
         assert len(chunks) == len(keys_to_store), (
             "Chunk pool did not allocate the expected number of chunks"
         )
@@ -539,7 +551,13 @@ class HybridOffloadingManager(OffloadingManager):
     Stores populate disk and opportunistically retain a suffix in CPU.
     """
 
-    def __init__(self, num_cpu_chunks: int, num_disk_chunks: int):
+    def __init__(
+        self,
+        num_cpu_chunks: int,
+        num_disk_chunks: int,
+        num_buffer_slots: int = 2,
+        max_load_slots: int = 8,
+    ):
         self.hot_capacity = num_cpu_chunks
         self.tiers = (
             CPUOffloadingManager(num_cpu_chunks),
@@ -547,6 +565,10 @@ class HybridOffloadingManager(OffloadingManager):
         )
         self.tiers[1].medium = Medium.STORAGE
         self._generation = 0
+        self.num_buffer_slots = num_buffer_slots
+        self.max_load_slots = max_load_slots
+        self._pending_cold_blocks = 0
+        self._staging_ids: list[int] = []
 
     def _state(self, ctx: ReqContext) -> _HybridRequestState:
         state = ctx.get_state(_HybridRequestState)
@@ -612,15 +634,28 @@ class HybridOffloadingManager(OffloadingManager):
             for i in range(2):
                 ids[i].append(int(spec.chunk_ids[0]) if i == idx else -1)
             state.loads.setdefault(key, []).append(idx)
-        return HybridLoadStoreSpec(*ids)
+        cold = sum(i >= 0 for i in ids[1])
+        self._pending_cold_blocks += cold
+        if cold:
+            target = min(self.max_load_slots, (self._pending_cold_blocks + 31) // 32)
+            extra = target - self.num_buffer_slots - len(self._staging_ids)
+            if extra > 0:
+                # Source pins above protect this and earlier jobs' hot hits.
+                self._staging_ids.extend(self.tiers[0]._lease_chunks(extra))
+        return HybridLoadStoreSpec(*ids, self._staging_ids.copy() if cold else [])
 
     def complete_load(self, keys: Collection[OffloadKey], req_context: ReqContext):
         state = self._state(req_context)
         for key in keys:
             idx = state.loads[key].pop(0)
             self.tiers[idx].complete_load([key], state.contexts[idx])
+            self._pending_cold_blocks -= int(idx == 1)
             if not state.loads[key]:
                 del state.loads[key]
+        if self._pending_cold_blocks == 0:
+            # All FIFO loads sharing these rows have drained I/O and DMA.
+            self.tiers[0]._free_list.extend(self._staging_ids)
+            self._staging_ids.clear()
 
     def prepare_store(
         self, keys: Collection[OffloadKey], req_context: ReqContext
@@ -685,6 +720,8 @@ class HybridOffloadingManager(OffloadingManager):
         for tier in self.tiers:
             tier.reset_cache()
         self._generation += 1
+        self._pending_cold_blocks = 0
+        self._staging_ids.clear()
 
     def get_stats(self) -> OffloadingConnectorStats | None:
         # Drain the disk allocator's observations without labeling them as CPU.

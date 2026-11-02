@@ -1019,6 +1019,7 @@ class HybridOffloadingWorker(OffloadingWorker):
         hot_batch_blocks: int,
         cpu_budget: int,
         block_bytes: int,
+        max_load_slots: int = 8,
     ):
         from vllm.v1.simple_kv_offload.cuda_mem_ops import (
             CU_MEMCPY_SRC_ACCESS_ORDER_ANY,
@@ -1065,6 +1066,9 @@ class HybridOffloadingWorker(OffloadingWorker):
         self.load_stream = torch.cuda.Stream(device=device, priority=0)
         self.store_stream = torch.cuda.Stream(device=device, priority=0)
         self.hot_batch_blocks = hot_batch_blocks
+        self.max_load_slots = min(max_load_slots, num_buffer_slots + num_cpu_blocks)
+        self.num_buffer_slots = num_buffer_slots
+        self._peak_load_slots = num_buffer_slots
         self.hot: dict[str, torch.Tensor] = {}
         self._jobs: dict[int, _HybridTransfer] = {}
         self._events: list[tuple[int, torch.Event]] = []
@@ -1103,6 +1107,7 @@ class HybridOffloadingWorker(OffloadingWorker):
                 actual_bytes,
                 num_buffer_slots=num_buffer_slots,
                 use_page_cache=False,
+                max_load_slots=self.max_load_slots,
             )
         except Exception:
             self.shutdown()
@@ -1116,6 +1121,7 @@ class HybridOffloadingWorker(OffloadingWorker):
         is_store: bool,
     ) -> bool:
         from vllm.v1.simple_kv_offload.cuda_mem_ops import copy_blocks
+        from vllm.v1.simple_kv_offload.disk_backend import DiskReadSlot
 
         if self._closed:
             raise RuntimeError("Hybrid KV Backend is shut down")
@@ -1128,6 +1134,28 @@ class HybridOffloadingWorker(OffloadingWorker):
             raise ValueError("Hybrid KV Backend requires one chunk per GPU block")
         hot = [(c, g) for c, g in zip(spec.cpu_ids, gpu_ids) if c >= 0]
         cold = [(d, g) for d, g in zip(spec.disk_ids, gpu_ids) if d >= 0]
+        slots = []
+        if spec.staging_ids:
+            if (
+                is_store
+                or not cold
+                or len(spec.staging_ids) + self.num_buffer_slots > self.max_load_slots
+                or len(set(spec.staging_ids)) != len(spec.staging_ids)
+                or set(spec.staging_ids) & {c for c, _ in hot}
+            ):
+                raise ValueError("Invalid Hybrid staging lease")
+            slots = [
+                DiskReadSlot(
+                    [memoryview(tensor[row].numpy()) for tensor in self.hot.values()],
+                    self._hot_load_params,
+                    row,
+                )
+                for row in spec.staging_ids
+            ]
+        active_slots = min(len(cold), self.num_buffer_slots + len(slots))
+        if not is_store and active_slots > self._peak_load_slots:
+            self._peak_load_slots = active_slots
+            logger.info("Hybrid KV Backend load-slot peak: %d", active_slots)
         stream = self.store_stream if is_store else self.load_stream
         fence = torch.Event()
         fence.record(torch.cuda.current_stream(stream.device))
@@ -1183,6 +1211,7 @@ class HybridOffloadingWorker(OffloadingWorker):
             before_read=None if is_store else hot_batch,
             before_store=store_hot if is_store else None,
             on_error=failed,
+            extra_load_slots=slots,
         )
         return True
 

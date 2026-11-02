@@ -111,6 +111,7 @@ def test_hybrid_pins_hot_and_disk_until_load_completion():
     assert manager.prepare_store(to_keys([2, 3]), ctx) is None
     output = manager.prepare_store(to_keys([2]), ctx)
     assert output is not None
+    assert isinstance(output.store_spec, HybridLoadStoreSpec)
     assert output.store_spec.cpu_ids == [-1]
     manager.complete_store(output.keys_to_store, ctx)
     manager.complete_load(keys, ctx)
@@ -171,6 +172,72 @@ def test_hybrid_reset_discards_lookup_and_request_transfer_state():
     manager.reset_cache()
     assert all(manager.lookup(key, ctx) == LookupResult.MISS for key in keys)
     assert manager.prepare_store(keys, ctx) is not None
+
+
+def test_hybrid_leases_grow_with_pending_reads_and_return_after_last_load():
+    manager = HybridOffloadingManager(8, 512, max_load_slots=8)
+    writer = make_req_context("writer")
+    first, second = make_req_context("first"), make_req_context("second")
+    keys = to_keys(list(range(160)))
+    manager.prepare_store(keys, writer)
+    manager.complete_store(keys, writer)
+    a = manager.prepare_load(keys[:128], first)
+    b = manager.prepare_load(keys[128:152], second)
+    assert 0 < len(a.staging_ids) < len(b.staging_ids) <= 6
+    assert set(a.staging_ids) <= set(b.staging_ids)
+    assert len(set(b.staging_ids)) == len(b.staging_ids)
+
+    manager.complete_load(keys[:128], first)
+    # A completed parent must not return rows still used by another reader.
+    offered = to_keys(list(range(200, 208)))
+    store = manager.prepare_store(offered, writer)
+    assert store is not None and isinstance(store.store_spec, HybridLoadStoreSpec)
+    assert store.store_spec.cpu_ids == [-1] * 8
+    manager.complete_store(offered, writer)
+    manager.complete_load(keys[128:152], second)
+    offered = to_keys(list(range(208, 216)))
+    store = manager.prepare_store(offered, writer)
+    assert store is not None and isinstance(store.store_spec, HybridLoadStoreSpec)
+    assert set(store.store_spec.cpu_ids) == set(range(8))
+
+
+def test_hybrid_leases_exclude_hot_reads_and_pending_stores():
+    manager = HybridOffloadingManager(8, 512)
+    writer, reader = make_req_context("writer"), make_req_context("reader")
+    keys = to_keys(list(range(160)))
+    manager.prepare_store(keys, writer)
+    manager.complete_store(keys, writer)
+    pinned = manager.prepare_load(keys[-4:], reader)
+    offered = to_keys(list(range(200, 204)))
+    store = manager.prepare_store(offered, writer)
+    assert store is not None and isinstance(store.store_spec, HybridLoadStoreSpec)
+    assert all(i >= 0 for i in store.store_spec.cpu_ids)
+    cold = manager.prepare_load(keys[:128], reader)
+    assert cold.staging_ids == []
+    manager.complete_store(offered, writer)
+    more = manager.prepare_load(keys[128:144], reader)
+    assert more.staging_ids
+    assert not set(more.staging_ids) & set(pinned.cpu_ids)
+    # Partial completion and request finalization do not release active leases.
+    manager.complete_load(keys[:64], reader)
+    manager.on_request_finished(reader)
+    manager.complete_load(keys[64:144] + keys[-4:], reader)
+
+
+@pytest.mark.parametrize("max_slots", [2, 8])
+def test_hybrid_reset_discards_staging_leases(max_slots):
+    manager = HybridOffloadingManager(8, 512, max_load_slots=max_slots)
+    ctx = make_req_context("reset")
+    keys = to_keys(list(range(160)))
+    manager.prepare_store(keys, ctx)
+    manager.complete_store(keys, ctx)
+    load = manager.prepare_load(keys[:128], ctx)
+    assert bool(load.staging_ids) == (max_slots > 2)
+    # The connector flushes old worker jobs before reusing post-reset rows.
+    manager.reset_cache()
+    output = manager.prepare_store(keys[:8], ctx)
+    assert output is not None and isinstance(output.store_spec, HybridLoadStoreSpec)
+    assert set(output.store_spec.cpu_ids) == set(range(8))
 
 
 def verify_store_output(

@@ -73,7 +73,7 @@ vllm serve <model> \
 ## Hybrid KV Backend (Experimental)
 
 `HybridOffloadingSpec` reuses SimpleCPU's `DiskBackend` file and I/O pipeline.
-Disk hits stream directly through fixed pinned buffers, so restoring a prefix
+Disk hits stream directly through bounded pinned buffers, so restoring a prefix
 does not require the whole prefix to fit in the CPU hot cache.
 
 ```mermaid
@@ -83,6 +83,10 @@ flowchart LR
     Store -->|O_DIRECT| SSD[Ephemeral SSD file]
     SSD -->|O_DIRECT| Load[1-2 load slots]
     Load --> GPU
+    Hot -->|lease idle rows under read pressure| Extra[Additional load slots]
+    SSD -->|parallel O_DIRECT reads| Extra
+    Extra --> GPU
+    Extra -->|return capacity after loads drain| Hot
     Hot -->|bounded batches during disk reads| GPU
 ```
 
@@ -98,6 +102,7 @@ vllm serve Qwen/Qwen3-4B --block-size 16 \
       "disk_path": "/mnt/nvme/vllm-kv",
       "blocks_per_chunk": 1,
       "num_buffer_slots": 2,
+      "max_load_slots": 8,
       "hot_batch_blocks": 1
     }
   }'
@@ -109,6 +114,7 @@ vllm serve Qwen/Qwen3-4B --block-size 16 \
 | `disk_bytes_to_use` | Maximum file size, rounded down to whole KV blocks. The sparse file does not reserve physical disk space. |
 | `disk_path` | Absolute file prefix on a filesystem supporting `O_DIRECT`; an engine/rank suffix is added. Use a private directory. |
 | `num_buffer_slots` | 1 or 2 slots **per direction**, default 2. |
+| `max_load_slots` | Maximum total load slots, default 8; must be at least `num_buffer_slots`. Extra slots lease hot-cache rows, not additional allocations. Set equal to `num_buffer_slots` to retain fixed-slot behavior. |
 | `hot_batch_blocks` | Maximum hot blocks submitted before each disk read, default 1. |
 
 ```mermaid
@@ -118,17 +124,18 @@ sequenceDiagram
     participant D as Disk thread
     participant G as CUDA load stream
     S->>S: Choose hot/disk source and pin each source
+    S->>S: Lease idle hot rows according to pending disk blocks
     S->>W: One parent load job
-    W->>D: Queue cold blocks and hot iterator
+    W->>D: Queue cold blocks, leased slots, and hot iterator
     loop Each cold block
         D->>D: Wait before reusing a staging slot
         D->>G: Submit a bounded hot batch
-        D->>D: Blocking preadv overlaps queued hot DMA
+        D->>D: Read into available slots; parallel preadv when leased
         D->>G: Submit the cold block
     end
     D->>G: Drain remaining hot batches and record final event
     W->>S: Report completion after the event
-    S->>S: Release source pins; GPU blocks may be consumed
+    S->>S: Release source pins; return leases when pending cold loads drain
 ```
 
 Stores allocate disk slots and opportunistically retain a suffix of the offered
@@ -136,7 +143,22 @@ blocks in the hot cache. Both caches use LRU; a busy hot cache does not prevent
 a disk store. Disk reads do not promote into the hot cache. A store becomes
 readable only after all its copies and writes complete. I/O failures report a
 failed parent transfer after draining queued DMA; preemption/reset waits for
-the submitted job to drain before reusing its blocks.
+the submitted job to drain before reusing its blocks, including all outstanding
+parallel reads on failure.
+
+The scheduler starts from the configured default slots and targets one load slot
+per 32 pending cold blocks, rounded up and clamped between `num_buffer_slots`
+and `max_load_slots`. It borrows free hot rows first, then evicts idle LRU entries;
+rows pinned by a load or pending store are never borrowed. Insufficient idle rows
+reduce the granted slots without blocking the load. Only the default load/store
+pools are permanently reserved. Leased rows remain unavailable for cache stores
+until all pending cold loads drain, then return as free cache capacity. Evicted
+contents are not restored or promoted automatically.
+
+Load jobs share one FIFO and may reuse the same leased rows sequentially. Within
+a job, a bounded thread pool issues one `preadv` per occupied slot and waits for
+DMA before reusing that slot. This is a demand-based heuristic, not a latency
+feedback controller; more slots need not improve performance on every device.
 
 The prototype supports one CUDA GPU, one full-attention group, one GPU block per
 offload chunk, and contiguous worker-local tensor pages aligned to 4096 bytes.

@@ -66,7 +66,8 @@ def test_cpu_spec_registered():
 
 
 @pytest.mark.parametrize("slots", [1, 2])
-def test_hybrid_budget_reserves_both_streaming_pools(tmp_path, slots):
+@pytest.mark.parametrize("max_slots", [2, 8, 16])
+def test_hybrid_budget_reserves_both_streaming_pools(tmp_path, slots, max_slots):
     spec = _create_spec(
         spec_name="HybridOffloadingSpec",
         worker_kv_bytes_per_block=4096,
@@ -75,6 +76,7 @@ def test_hybrid_budget_reserves_both_streaming_pools(tmp_path, slots):
             "disk_path": str(tmp_path / "cache"),
             "disk_bytes_to_use": 64 * 4096,
             "num_buffer_slots": slots,
+            "max_load_slots": max_slots,
         },
     )
     assert isinstance(spec, HybridOffloadingSpec)
@@ -89,6 +91,7 @@ def test_hybrid_budget_reserves_both_streaming_pools(tmp_path, slots):
         {"blocks_per_chunk": 2},
         {"worker_kv_bytes_per_block": 1234},
         {"cpu_bytes_to_use": 4096},
+        {"extra_config": {"disk_path": "/tmp/cache", "max_load_slots": 1}},
         {"groups": (OffloadingGroupConfig(16, ("layer",), 0, 4),)},
     ],
 )

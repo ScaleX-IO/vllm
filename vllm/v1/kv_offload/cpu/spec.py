@@ -267,12 +267,17 @@ class HybridOffloadingSpec(OffloadingSpec):
         self.cpu_budget = int(self.extra_config.get("cpu_bytes_to_use", 0))
         disk_budget = int(self.extra_config.get("disk_bytes_to_use", 0))
         self.num_buffer_slots = int(self.extra_config.get("num_buffer_slots", 2))
+        self.max_load_slots = int(self.extra_config.get("max_load_slots", 8))
         self.hot_batch_blocks = int(self.extra_config.get("hot_batch_blocks", 1))
         self.disk_path = self.extra_config.get("disk_path")
         if not self.disk_path or not os.path.isabs(self.disk_path):
             raise ValueError("Hybrid KV Backend requires an absolute disk_path")
         if self.num_buffer_slots not in (1, 2) or self.hot_batch_blocks < 1:
             raise ValueError("Use 1-2 streaming slots and a positive hot_batch_blocks")
+        if self.max_load_slots < self.num_buffer_slots:
+            raise ValueError(
+                "Hybrid KV Backend max_load_slots must cover default slots"
+            )
         self.block_bytes = config.worker_kv_bytes_per_block
         if self.block_bytes <= 0 or self.block_bytes % 4096:
             raise ValueError("Hybrid KV Backend requires 4096-aligned block bytes")
@@ -292,7 +297,10 @@ class HybridOffloadingSpec(OffloadingSpec):
     def get_manager(self) -> OffloadingManager:
         if self._manager is None:
             self._manager = HybridOffloadingManager(
-                self.num_cpu_blocks, self.num_disk_blocks
+                self.num_cpu_blocks,
+                self.num_disk_blocks,
+                self.num_buffer_slots,
+                self.max_load_slots,
             )
         return self._manager
 
@@ -314,5 +322,6 @@ class HybridOffloadingSpec(OffloadingSpec):
                 self.hot_batch_blocks,
                 self.cpu_budget,
                 self.block_bytes,
+                self.max_load_slots,
             )
         return self._worker
