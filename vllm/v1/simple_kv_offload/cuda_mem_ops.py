@@ -222,6 +222,9 @@ class BatchMemcpyParams(NamedTuple):
     # cuMemcpyBatchAsync() with fail_idx for backward compatibility
     fail_idx: ctypes.c_size_t
     stream_handle: int  # raw cudaStream_t / CUstream
+    # Optional per-job addresses indexed by [layer, transfer block].
+    src_ptrs: np.ndarray | None = None
+    dst_ptrs: np.ndarray | None = None
 
 
 def build_params(
@@ -280,9 +283,13 @@ def copy_blocks(
 
     src_all = (
         params.src_bases[:, None] + src_ids[None, :] * params.bpb[:, None]
+        if params.src_ptrs is None
+        else params.src_ptrs[:, src_ids]
     ).ravel()
     dst_all = (
         params.dst_bases[:, None] + dst_ids[None, :] * params.bpb[:, None]
+        if params.dst_ptrs is None
+        else params.dst_ptrs[:, dst_ids]
     ).ravel()
     sz_all = np.repeat(params.bpb, n)
     total = n * params.num_layers

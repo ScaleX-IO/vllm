@@ -17,6 +17,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, wait
 from typing import NamedTuple
 
+import numpy as np
 import torch
 
 from vllm.logger import init_logger
@@ -216,6 +217,7 @@ class DiskBackend:
         before_store: Callable[[], None] | None = None,
         on_error: Callable[[Exception], None] | None = None,
         extra_load_slots: list[DiskReadSlot] | None = None,
+        device_ptrs: np.ndarray | None = None,
     ) -> None:
         q = self._store_queue if is_store else self._load_queue
         q.put(
@@ -229,6 +231,7 @@ class DiskBackend:
                 before_store,
                 on_error,
                 extra_load_slots,
+                device_ptrs,
             )
         )
 
@@ -287,18 +290,35 @@ class DiskBackend:
             self._run_job(item, stream, is_store=True)
 
     def _run_job(self, item: tuple, stream: torch.cuda.Stream, is_store: bool) -> None:
-        (src, dst, idx, events, fence, before_read, before_store, on_error, slots) = (
-            item
-        )
+        (
+            src,
+            dst,
+            idx,
+            events,
+            fence,
+            before_read,
+            before_store,
+            on_error,
+            slots,
+            ptrs,
+        ) = item
         try:
+            params = self._store_params if is_store else self._load_params
+            assert params is not None
+            if ptrs is not None:
+                params = (
+                    params._replace(src_ptrs=ptrs)
+                    if is_store
+                    else params._replace(dst_ptrs=ptrs)
+                )
             if fence is not None:
                 stream.wait_event(fence)
             if is_store:
                 if before_store is not None:
                     before_store()
-                self._do_store(src, dst, stream)
+                self._do_store(src, dst, stream, params)
             else:
-                self._do_load(src, dst, stream, before_read, slots)
+                self._do_load(src, dst, stream, params, before_read, slots)
             event = torch.Event()
             event.record(stream)
             events.append((idx, event))
@@ -351,9 +371,9 @@ class DiskBackend:
         gpu_blocks: list[int],
         disk_slots: list[int],
         stream: torch.cuda.Stream,
+        params: BatchMemcpyParams,
     ) -> None:
         """GPU -> buffer (DMA) -> disk (pwritev), interleaved double-buffer."""
-        assert self._store_params is not None
         n = self._num_buffer_slots
         # (DMA event, file offset) of the block already staged in each slot.
         pending: list[tuple[torch.Event, int] | None] = [None] * n
@@ -365,7 +385,7 @@ class DiskBackend:
                 prev[0].synchronize()
                 self._writev_slot(buf_slot, prev[1])
 
-            copy_blocks([gpu_blk], [buf_slot], self._store_params)
+            copy_blocks([gpu_blk], [buf_slot], params)
             ev = torch.Event()
             ev.record(stream)
             pending[buf_slot] = (ev, disk_slot * self._total_block_bytes)
@@ -380,14 +400,14 @@ class DiskBackend:
         disk_slots: list[int],
         gpu_blocks: list[int],
         stream: torch.cuda.Stream,
+        params: BatchMemcpyParams,
         before_read: Callable[[], bool] | None = None,
         extra_load_slots: list[DiskReadSlot] | None = None,
     ) -> None:
         """Disk (preadv) -> buffer -> GPU (DMA), interleaved double-buffer."""
-        assert self._load_params is not None
         if extra_load_slots:
             self._do_load_parallel(
-                disk_slots, gpu_blocks, stream, before_read, extra_load_slots
+                disk_slots, gpu_blocks, stream, params, before_read, extra_load_slots
             )
             return
         n = self._num_buffer_slots
@@ -403,7 +423,7 @@ class DiskBackend:
                 before_read()
             self._readv_slot(buf_slot, disk_slot * self._total_block_bytes)
 
-            copy_blocks([buf_slot], [gpu_blk], self._load_params)
+            copy_blocks([buf_slot], [gpu_blk], params)
             ev = torch.Event()
             ev.record(stream)
             prev_dma_events[buf_slot] = ev
@@ -420,13 +440,14 @@ class DiskBackend:
         disk_blocks: list[int],
         gpu_blocks: list[int],
         stream: torch.cuda.Stream,
+        params: BatchMemcpyParams,
         before_read: Callable[[], bool] | None,
         extra_slots: list[DiskReadSlot],
     ) -> None:
-        assert self._load_params is not None and self._read_executor is not None
+        assert self._read_executor is not None
         executor = self._read_executor
         slots = [
-            DiskReadSlot(views, self._load_params, i)
+            DiskReadSlot(views, params, i)
             for i, views in enumerate(self._load_slot_views)
         ] + extra_slots
         slots = slots[: len(disk_blocks)]

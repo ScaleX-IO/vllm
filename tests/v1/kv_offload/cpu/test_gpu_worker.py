@@ -9,6 +9,7 @@ import time
 import uuid
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 import torch
 
@@ -20,6 +21,7 @@ from vllm.v1.kv_offload.base import (
     CanonicalKVCacheRef,
     CanonicalKVCaches,
     CanonicalKVCacheTensor,
+    DevicePointers,
     GPULoadStoreSpec,
     ReqContext,
     TransferResult,
@@ -33,6 +35,7 @@ from vllm.v1.kv_offload.cpu.gpu_worker import (
 )
 from vllm.v1.kv_offload.cpu.manager import HybridOffloadingManager
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+from vllm.v1.kv_offload.pointer_utils import resolve_device_pointers
 
 NUM_GPU_BLOCKS = [64]
 NUM_CPU_CHUNKS = [256]
@@ -59,8 +62,9 @@ def _wait_hybrid(worker, job_id, timeout=10):
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA-only prototype")
 @pytest.mark.parametrize("num_slots", [1, 2])
-@pytest.mark.parametrize("hot_blocks", [0, 2, 8])
-@pytest.mark.parametrize("leased_blocks", [0, 2, 6])
+@pytest.mark.parametrize(
+    "hot_blocks,leased_blocks", [(0, 0), (0, 6), (2, 0), (2, 2), (2, 6), (8, 0)]
+)
 def test_hybrid_direct_io_restores_mixed_blocks(
     tmp_path, num_slots, hot_blocks, leased_blocks
 ):
@@ -70,10 +74,11 @@ def test_hybrid_direct_io_restores_mixed_blocks(
         torch.randint(0, 127, (16, 4096), dtype=torch.int8, device="cuda")
         for _ in range(2)
     ]
-    expected = [t[:8].clone() for t in tensors]
+    source_blocks = [6, 0, 4, 1, 7, 2, 5, 3]
+    expected = [t[source_blocks].clone() for t in tensors]
     caches = CanonicalKVCaches(
         [CanonicalKVCacheTensor(t, 4096) for t in tensors],
-        [[CanonicalKVCacheRef(i, 4096) for i in range(2)]],
+        [[CanonicalKVCacheRef(i, 4096) for i in (1, 0)]],
     )
     path = str(tmp_path / "hybrid.kv")
     worker = HybridOffloadingWorker(
@@ -99,21 +104,30 @@ def test_hybrid_direct_io_restores_mixed_blocks(
         assert fcntl.fcntl(descriptors[0], fcntl.F_GETFL) & os.O_DIRECT
         hot_ids = [-1] * (8 - hot_blocks) + list(range(hot_blocks))
         store = HybridLoadStoreSpec(hot_ids, list(range(8)))
-        worker.submit_store(1, GPULoadStoreSpec(list(range(8)), [8], [0]), store)
+        worker.submit_store(
+            1,
+            resolve_device_pointers(GPULoadStoreSpec(source_blocks, [8], [0]), caches),
+            store,
+        )
         assert _wait_hybrid(worker, 1).success
         load = HybridLoadStoreSpec(
             hot_ids,
             list(range(8 - hot_blocks)) + [-1] * hot_blocks,
-            list(range(hot_blocks, hot_blocks + leased_blocks))
-            if hot_blocks < 8
-            else [],
+            list(range(hot_blocks, hot_blocks + leased_blocks)),
         )
-        # Noncontiguous destinations detect accidental compacting of mixed hits.
+        # Different per-tensor destinations require using the supplied addresses.
         destinations = [15, 8, 14, 9, 13, 10, 12, 11]
-        worker.submit_load(2, load, GPULoadStoreSpec(destinations, [8], [0]))
+        device_ptrs = resolve_device_pointers(
+            GPULoadStoreSpec(destinations, [8], [0]), caches
+        )
+        reversed_ptrs = resolve_device_pointers(
+            GPULoadStoreSpec(destinations[::-1], [8], [0]), caches
+        )
+        device_ptrs.ptrs[8:] = reversed_ptrs.ptrs[8:]
+        worker.submit_load(2, load, device_ptrs)
         assert _wait_hybrid(worker, 2).success
-        for tensor, reference in zip(tensors, expected):
-            assert torch.equal(tensor[destinations], reference)
+        assert torch.equal(tensors[1][destinations], expected[1])
+        assert torch.equal(tensors[0][destinations[::-1]], expected[0])
     finally:
         worker.shutdown()
     assert not os.path.exists(path)
@@ -128,11 +142,11 @@ def test_hybrid_short_read_reports_failure_and_accepts_next_job(tmp_path):
     path = str(tmp_path / "hybrid.kv")
     worker = HybridOffloadingWorker(caches, 1, 1, path, 2, 1, 8 * 4096, 4096)
     try:
-        source = GPULoadStoreSpec([0], [1], [0])
+        source = resolve_device_pointers(GPULoadStoreSpec([0], [1], [0]), caches)
         worker.submit_store(1, source, HybridLoadStoreSpec([0], [0]))
         assert _wait_hybrid(worker, 1).success
         os.truncate(path, 0)
-        target = GPULoadStoreSpec([1], [1], [0])
+        target = resolve_device_pointers(GPULoadStoreSpec([1], [1], [0]), caches)
         worker.submit_load(2, HybridLoadStoreSpec([-1], [0]), target)
         assert not _wait_hybrid(worker, 2).success
         worker.submit_load(3, HybridLoadStoreSpec([0], [-1]), target)
@@ -167,7 +181,7 @@ def test_hybrid_hot_batch_overlaps_blocked_read_without_completing_parent(
     try:
         worker.submit_store(
             1,
-            GPULoadStoreSpec([0, 1, 2], [3], [0]),
+            resolve_device_pointers(GPULoadStoreSpec([0, 1, 2], [3], [0]), caches),
             HybridLoadStoreSpec([-1, 0, 1], [0, 1, 2]),
         )
         assert _wait_hybrid(worker, 1).success
@@ -175,7 +189,7 @@ def test_hybrid_hot_batch_overlaps_blocked_read_without_completing_parent(
         worker.submit_load(
             2,
             HybridLoadStoreSpec([-1, 0, 1], [0, -1, -1]),
-            GPULoadStoreSpec([3, 4, 5], [3], [0]),
+            resolve_device_pointers(GPULoadStoreSpec([3, 4, 5], [3], [0]), caches),
         )
         assert entered.wait(timeout=10)
         torch.accelerator.synchronize()
@@ -212,7 +226,11 @@ def test_hybrid_shared_leases_survive_queued_loads_and_concurrent_store(
         store = manager.prepare_store(keys[:256], writer)
         assert store is not None
         worker.submit_store(
-            0, GPULoadStoreSpec(list(range(256)), [256], [0]), store.store_spec
+            0,
+            resolve_device_pointers(
+                GPULoadStoreSpec(list(range(256)), [256], [0]), caches
+            ),
+            store.store_spec,
         )
         assert _wait_hybrid(worker, 0).success
         manager.complete_store(store.keys_to_store, writer)
@@ -222,12 +240,20 @@ def test_hybrid_shared_leases_survive_queued_loads_and_concurrent_store(
             load = manager.prepare_load(keys[:128], ctx)
             assert 0 < len(load.staging_ids) <= 6
             destinations = list(range(256 + (job - 1) * 128, 256 + job * 128))
-            worker.submit_load(job, load, GPULoadStoreSpec(destinations, [128], [0]))
+            worker.submit_load(
+                job,
+                load,
+                resolve_device_pointers(
+                    GPULoadStoreSpec(destinations, [128], [0]), caches
+                ),
+            )
             contexts[job] = ctx
         store = manager.prepare_store(keys[300:308], writer)
         assert store is not None
         worker.submit_store(
-            readers + 1, GPULoadStoreSpec(list(range(8)), [8], [0]), store.store_spec
+            readers + 1,
+            resolve_device_pointers(GPULoadStoreSpec(list(range(8)), [8], [0]), caches),
+            store.store_spec,
         )
         worker.wait(set(range(1, readers + 2)))
         completed = worker.get_finished()
@@ -283,7 +309,7 @@ def test_hybrid_failed_parallel_read_waits_for_sibling_before_releasing_lease(
     try:
         worker.submit_store(
             1,
-            GPULoadStoreSpec([0, 1, 2, 3], [4], [0]),
+            resolve_device_pointers(GPULoadStoreSpec([0, 1, 2, 3], [4], [0]), caches),
             HybridLoadStoreSpec([-1] * 4, [0, 1, 2, 3]),
         )
         assert _wait_hybrid(worker, 1).success
@@ -292,7 +318,9 @@ def test_hybrid_failed_parallel_read_waits_for_sibling_before_releasing_lease(
             worker.submit_load(
                 2,
                 HybridLoadStoreSpec([-1] * 4, [0, 1, 2, 3], [0, 1]),
-                GPULoadStoreSpec([4, 5, 6, 7], [4], [0]),
+                resolve_device_pointers(
+                    GPULoadStoreSpec([4, 5, 6, 7], [4], [0]), caches
+                ),
             )
             assert failed.wait(10)
             waiter.start()
@@ -305,7 +333,7 @@ def test_hybrid_failed_parallel_read_waits_for_sibling_before_releasing_lease(
         worker.submit_load(
             3,
             HybridLoadStoreSpec([-1] * 4, [0, 1, 2, 3], [0, 1]),
-            GPULoadStoreSpec([4, 5, 6, 7], [4], [0]),
+            resolve_device_pointers(GPULoadStoreSpec([4, 5, 6, 7], [4], [0]), caches),
         )
         assert _wait_hybrid(worker, 3).success
         assert torch.equal(tensor[:4], tensor[4:])
@@ -467,8 +495,7 @@ def test_handler_shutdown_skips_transfers_after_event_sync_failure() -> None:
     handler._stream_pool = [MagicMock()]
     handler._event_pool = [MagicMock()]
     handler._buffer_pool = [(MagicMock(), MagicMock(), MagicMock())]
-    handler.src_tensors = [MagicMock()]
-    handler.dst_tensors = [MagicMock()]
+    handler.cpu_tensors = [MagicMock()]
 
     with pytest.raises(RuntimeError, match="device lost"):
         handler.shutdown()
@@ -479,8 +506,7 @@ def test_handler_shutdown_skips_transfers_after_event_sync_failure() -> None:
     assert not handler._stream_pool
     assert not handler._event_pool
     assert not handler._buffer_pool
-    assert not handler.src_tensors
-    assert not handler.dst_tensors
+    assert not handler.cpu_tensors
 
 
 def _bare_handler(gpu_to_cpu: bool = True):
@@ -501,8 +527,7 @@ def _submittable_handler(monkeypatch: pytest.MonkeyPatch, gpu_to_cpu: bool = Tru
     """Bare handler wired up far enough to run transfer_async off-device."""
     handler = _bare_handler(gpu_to_cpu)
     handler.layer_refs_per_group = [MagicMock()]
-    handler.src_blocks_per_chunk = 1
-    handler.dst_blocks_per_chunk = 1
+    handler.blocks_per_chunk = 1
     handler._estimate_max_copy_ops = lambda group_sizes: 4
     handler._fill_group_ops = lambda g_idx, **kwargs: (1, 128)
     handler._swap_blocks_batch = MagicMock()
@@ -516,8 +541,15 @@ def _submittable_handler(monkeypatch: pytest.MonkeyPatch, gpu_to_cpu: bool = Tru
 
 
 def _submit(handler, job_id: int) -> bool:
-    spec = GPULoadStoreSpec(block_ids=[0], group_sizes=[1], block_indices=[0])
-    return handler.transfer_async(job_id, spec, spec)
+    device_ptrs = DevicePointers(
+        ptrs=np.zeros(1, dtype=np.uint64),
+        sizes=np.zeros(1, dtype=np.uint64),
+        group_block_counts=(1,),
+        group_data_ref_counts=(1,),
+        block_indices=(0,),
+    )
+    cpu_spec = CPULoadStoreSpec(block_ids=[0])
+    return handler.transfer_async(job_id, device_ptrs, cpu_spec)
 
 
 def test_submit_failure_is_not_reported_until_stream_drains(
@@ -824,40 +856,40 @@ def test_transfer(
         gpu_blocks = gpu_blocks[blocks_to_skip:]
         cpu_chunks_expanded = cpu_chunks_expanded[blocks_to_skip:]
 
-    # set transfer direction
+    # build specs and resolve device pointers
+    gpu_spec = GPULoadStoreSpec(
+        gpu_blocks, group_sizes=(len(gpu_blocks),), block_indices=(blocks_to_skip,)
+    )
+    cpu_spec = CPULoadStoreSpec(cpu_chunks)
+    device_ptrs = resolve_device_pointers(gpu_spec, kv_caches)
+
+    handler = worker._store_handler if gpu_to_cpu else worker._load_handler
     if gpu_to_cpu:
-        handler = worker._store_handler
-        gpu_spec = GPULoadStoreSpec(
-            gpu_blocks, group_sizes=(len(gpu_blocks),), block_indices=(blocks_to_skip,)
-        )
-        cpu_spec = CPULoadStoreSpec(cpu_chunks)
         dst_to_src = dict(zip(cpu_chunks_expanded, gpu_blocks))
-        num_dst_sub_blocks = num_gpu_blocks
     else:
-        handler = worker._load_handler
-        cpu_spec = CPULoadStoreSpec(cpu_chunks)
-        gpu_spec = GPULoadStoreSpec(
-            gpu_blocks, group_sizes=(len(gpu_blocks),), block_indices=(blocks_to_skip,)
-        )
         dst_to_src = dict(zip(gpu_blocks, cpu_chunks_expanded))
-        num_dst_sub_blocks = num_gpu_blocks
+    num_dst_sub_blocks = num_gpu_blocks
 
-    # randomize src and dst tensors before transfer
-    for tensor in handler.src_tensors:
+    # collect gpu and cpu tensor lists for verification
+    gpu_tensors = [t.tensor for t in kv_caches.tensors]
+    cpu_tensors = handler.cpu_tensors
+
+    # randomize all tensors before transfer
+    for tensor in gpu_tensors:
         tensor.random_()
-    for tensor in handler.dst_tensors:
+    for tensor in cpu_tensors:
         tensor.random_()
 
-    # clone src and dst tensors before transfer
-    orig_src_tensors = [x.clone() for x in handler.src_tensors]
-    orig_dst_tensors = [x.clone() for x in handler.dst_tensors]
+    # clone tensors before transfer
+    orig_gpu_tensors = [x.clone() for x in gpu_tensors]
+    orig_cpu_tensors = [x.clone() for x in cpu_tensors]
 
     # call transfer function via public API
     start_time = time.time()
     if gpu_to_cpu:
-        assert worker.submit_store(1, gpu_spec, cpu_spec)
+        assert worker.submit_store(1, device_ptrs, cpu_spec)
     else:
-        assert worker.submit_load(1, cpu_spec, gpu_spec)
+        assert worker.submit_load(1, cpu_spec, device_ptrs)
     assert {x.job_id for x in handler._transfers} == {1}
 
     # wait for transfer to complete
@@ -879,15 +911,21 @@ def test_transfer(
             break
         time.sleep(0.1)
 
+    # determine src/dst by direction
+    if gpu_to_cpu:
+        src_tensors, dst_tensors = gpu_tensors, cpu_tensors
+        orig_src_tensors, orig_dst_tensors = orig_gpu_tensors, orig_cpu_tensors
+    else:
+        src_tensors, dst_tensors = cpu_tensors, gpu_tensors
+        orig_src_tensors, orig_dst_tensors = orig_cpu_tensors, orig_gpu_tensors
+
     # verify src tensors did not change
-    for orig_tensor, tensor in zip(orig_src_tensors, handler.src_tensors):
+    for orig_tensor, tensor in zip(orig_src_tensors, src_tensors):
         assert torch.equal(orig_tensor, tensor)
 
     # verify dst tensors at gpu-page granularity.
     for src_tensor, dst_tensor, orig_dst_tensor in zip(
-        handler.src_tensors,
-        handler.dst_tensors,
-        orig_dst_tensors,
+        src_tensors, dst_tensors, orig_dst_tensors
     ):
         # view both GPU and CPU tensors as (n, gpu_page_size_bytes) for comparison.
         src_view = src_tensor.reshape(-1, gpu_page_size_bytes)
@@ -1031,12 +1069,15 @@ def test_transfer_multi_group(
     # block_indices: only relevant for unaligned transfers
     block_indices: list[int] = [0, 0, sub_blocks_to_skip]
 
+    # build specs and resolve device pointers
+    gpu_spec = GPULoadStoreSpec(
+        gpu_blocks, group_sizes=group_sizes, block_indices=block_indices
+    )
+    cpu_spec = CPULoadStoreSpec(cpu_chunks)
+    device_ptrs = resolve_device_pointers(gpu_spec, canonical_kv_caches)
+
+    handler = worker._store_handler if gpu_to_cpu else worker._load_handler
     if gpu_to_cpu:
-        handler = worker._store_handler
-        gpu_spec = GPULoadStoreSpec(
-            gpu_blocks, group_sizes=group_sizes, block_indices=block_indices
-        )
-        cpu_spec = CPULoadStoreSpec(cpu_chunks)
         # per-group mapping: cpu sub-block -> gpu sub-block
         dst_to_src_per_group = [
             dict(zip(expanded, gpu_blks))
@@ -1046,11 +1087,6 @@ def test_transfer_multi_group(
         ]
         num_dst_sub_blocks = num_cpu_chunks * blocks_per_chunk
     else:
-        handler = worker._load_handler
-        cpu_spec = CPULoadStoreSpec(cpu_chunks)
-        gpu_spec = GPULoadStoreSpec(
-            gpu_blocks, group_sizes=group_sizes, block_indices=block_indices
-        )
         # per-group mapping: gpu sub-block -> cpu sub-block
         dst_to_src_per_group = [
             dict(zip(gpu_blks, expanded))
@@ -1060,19 +1096,23 @@ def test_transfer_multi_group(
         ]
         num_dst_sub_blocks = num_gpu_blocks
 
-    # randomize src and dst tensors before transfer
-    for tensor in handler.src_tensors:
+    # collect gpu and cpu tensor lists for verification
+    gpu_tensors = [t.tensor for t in canonical_kv_caches.tensors]
+    cpu_tensors = handler.cpu_tensors
+
+    # randomize all tensors before transfer
+    for tensor in gpu_tensors:
         tensor.random_()
-    for tensor in handler.dst_tensors:
+    for tensor in cpu_tensors:
         tensor.random_()
 
-    orig_src_tensors = [x.clone() for x in handler.src_tensors]
-    orig_dst_tensors = [x.clone() for x in handler.dst_tensors]
+    orig_gpu_tensors = [x.clone() for x in gpu_tensors]
+    orig_cpu_tensors = [x.clone() for x in cpu_tensors]
 
     if gpu_to_cpu:
-        assert worker.submit_store(1, gpu_spec, cpu_spec)
+        assert worker.submit_store(1, device_ptrs, cpu_spec)
     else:
-        assert worker.submit_load(1, cpu_spec, gpu_spec)
+        assert worker.submit_load(1, cpu_spec, device_ptrs)
     assert {x.job_id for x in handler._transfers} == {1}
 
     end_time = time.time() + 10
@@ -1091,16 +1131,24 @@ def test_transfer_multi_group(
             break
         time.sleep(0.1)
 
+    # determine src/dst by direction
+    if gpu_to_cpu:
+        src_tensors, dst_tensors = gpu_tensors, cpu_tensors
+        orig_src_tensors, orig_dst_tensors = orig_gpu_tensors, orig_cpu_tensors
+    else:
+        src_tensors, dst_tensors = cpu_tensors, gpu_tensors
+        orig_src_tensors, orig_dst_tensors = orig_cpu_tensors, orig_gpu_tensors
+
     # verify src tensors did not change
-    for orig_tensor, tensor in zip(orig_src_tensors, handler.src_tensors):
+    for orig_tensor, tensor in zip(orig_src_tensors, src_tensors):
         assert torch.equal(orig_tensor, tensor)
 
     # verify dst tensors at gpu-page granularity
     for group_idx, dst_to_src in enumerate(dst_to_src_per_group):
         group_tensor_offset = group_idx * tensors_per_group
         for tensor_idx in range(tensors_per_group):
-            src_tensor = handler.src_tensors[group_tensor_offset + tensor_idx]
-            dst_tensor = handler.dst_tensors[group_tensor_offset + tensor_idx]
+            src_tensor = src_tensors[group_tensor_offset + tensor_idx]
+            dst_tensor = dst_tensors[group_tensor_offset + tensor_idx]
             orig_dst_tensor = orig_dst_tensors[group_tensor_offset + tensor_idx]
             src_view = src_tensor.view(-1, gpu_page_size_bytes)
             dst_view = dst_tensor.view(-1, gpu_page_size_bytes)
@@ -1135,21 +1183,20 @@ def test_load_waits_for_pending_compute_stream_writes(default_vllm_config) -> No
         (num_blocks, page_size_bytes), dtype=torch.int8, device=device
     )
     loaded_block_ids = torch.tensor(loaded_blocks, dtype=torch.long, device=device)
+    kv_caches = CanonicalKVCaches(
+        tensors=[
+            CanonicalKVCacheTensor(tensor=gpu_tensor, page_size_bytes=page_size_bytes)
+        ],
+        group_data_refs=[
+            [CanonicalKVCacheRef(tensor_idx=0, page_size_bytes=page_size_bytes)]
+        ],
+    )
     worker = CPUOffloadingWorker(
-        kv_caches=CanonicalKVCaches(
-            tensors=[
-                CanonicalKVCacheTensor(
-                    tensor=gpu_tensor, page_size_bytes=page_size_bytes
-                )
-            ],
-            group_data_refs=[
-                [CanonicalKVCacheRef(tensor_idx=0, page_size_bytes=page_size_bytes)]
-            ],
-        ),
+        kv_caches=kv_caches,
         blocks_per_chunk=1,
         num_cpu_chunks=num_blocks,
     )
-    worker._load_handler.src_tensors[0].fill_(sentinel)
+    worker._load_handler.cpu_tensors[0].fill_(sentinel)
     expected = torch.full((page_size_bytes,), sentinel, dtype=torch.int8)
 
     try:
@@ -1163,14 +1210,16 @@ def test_load_waits_for_pending_compute_stream_writes(default_vllm_config) -> No
             torch.cuda._sleep(50_000_000)
             gpu_tensor.index_fill_(0, loaded_block_ids, 0)
 
+            gpu_spec = GPULoadStoreSpec(
+                loaded_blocks,
+                group_sizes=(len(loaded_blocks),),
+                block_indices=(0,),
+            )
+            device_ptrs = resolve_device_pointers(gpu_spec, kv_caches)
             assert worker.submit_load(
                 trial + 1,
                 CPULoadStoreSpec(loaded_blocks),
-                GPULoadStoreSpec(
-                    loaded_blocks,
-                    group_sizes=(len(loaded_blocks),),
-                    block_indices=(0,),
-                ),
+                device_ptrs,
             )
             deadline = time.time() + 10
             finished: list[TransferResult] = []
@@ -1208,17 +1257,16 @@ def test_device_fault_does_not_fail_the_next_kernel_launch(
     gpu_tensor = torch.zeros(
         (num_blocks, page_size_bytes), dtype=torch.int8, device=DEVICES[0]
     )
+    kv_caches = CanonicalKVCaches(
+        tensors=[
+            CanonicalKVCacheTensor(tensor=gpu_tensor, page_size_bytes=page_size_bytes)
+        ],
+        group_data_refs=[
+            [CanonicalKVCacheRef(tensor_idx=0, page_size_bytes=page_size_bytes)]
+        ],
+    )
     worker = CPUOffloadingWorker(
-        kv_caches=CanonicalKVCaches(
-            tensors=[
-                CanonicalKVCacheTensor(
-                    tensor=gpu_tensor, page_size_bytes=page_size_bytes
-                )
-            ],
-            group_data_refs=[
-                [CanonicalKVCacheRef(tensor_idx=0, page_size_bytes=page_size_bytes)]
-            ],
-        ),
+        kv_caches=kv_caches,
         blocks_per_chunk=1,
         num_cpu_chunks=num_blocks,
     )
@@ -1238,12 +1286,13 @@ def test_device_fault_does_not_fail_the_next_kernel_launch(
     gpu_spec = GPULoadStoreSpec(
         list(range(num_blocks)), group_sizes=(num_blocks,), block_indices=(0,)
     )
+    device_ptrs = resolve_device_pointers(gpu_spec, kv_caches)
     cpu_spec = CPULoadStoreSpec(list(range(num_blocks)))
     try:
         if gpu_to_cpu:
-            assert worker.submit_store(1, gpu_spec, cpu_spec)
+            assert worker.submit_store(1, device_ptrs, cpu_spec)
         else:
-            assert worker.submit_load(1, cpu_spec, gpu_spec)
+            assert worker.submit_load(1, cpu_spec, device_ptrs)
         if not faulted:
             pytest.skip("this runtime accepts zero-size copies")
 
